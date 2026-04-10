@@ -1,0 +1,260 @@
+Codex speed-up session history
+==============================
+
+Date
+----
+
+- 2026-04-10
+
+
+Context
+-------
+
+This session focused on performance analysis and optimization of `cutadapt-rs`,
+starting from the benchmark reported in `README.md` for commit `0ad2e08`.
+
+Initial public benchmark:
+
+- Dataset: 9,880,559 paired-end reads
+- Read length: 150 bp
+- Platform: Illumina
+- Scenario: standard TruSeq adapter trimming
+- Python cutadapt 5.2: `1m 07s`
+- Rust cutadapt-rs: `1m 47s`
+- Output statistics were numerically identical
+
+
+Phase 1: Bottleneck analysis only
+---------------------------------
+
+The user first asked for optimization ideas only, without code changes.
+
+Main conclusions:
+
+1. The top structural issue was not the adapter matching core itself, but the
+   surrounding pipeline.
+
+2. The most important bottlenecks were identified as:
+   - full-input buffering via `read_all()`
+   - single-threaded gzip output
+   - hot-path cloning, repeated allocation, and repeated modifier construction
+
+3. Specific baseline code locations discussed:
+   - `crates/cutadapt/src/main.rs`
+     - `read_all()` in the main pipeline
+     - per-read construction of trimmers/cutters
+     - per-read `write_record()` calls
+   - `crates/cutadapt-core/src/files.rs`
+     - gzip writer based on `flate2::write::GzEncoder`
+     - parsing paths that allocate and copy eagerly
+   - `crates/cutadapt-core/src/info.rs`
+     - `ModificationInfo::new(record.clone())`
+   - `crates/cutadapt-core/src/record.rs`
+     - `slice()` creating new owned strings
+   - `crates/cutadapt-core/src/adapters/matches.rs`
+     - match objects copying sequence and adapter metadata
+
+Recommended optimization order from the analysis phase:
+
+1. Fix the gzip/write path first.
+2. Replace `read_all()` with streaming or chunked processing.
+3. Remove hot-path clones and repeated object construction.
+4. Only after that, consider deeper matcher or multi-core processing work.
+
+
+Phase 2: Optimization in a new worktree
+---------------------------------------
+
+The user then requested implementation in a new worktree.
+
+Worktree details:
+
+- Path: `/tmp/cutadapt-rs-speedopt`
+- Branch: `perf/speed-opt-20260410`
+
+Main code changes made there:
+
+1. Streaming / chunked pipeline
+   - Replaced whole-file `read_all()` style execution with batched processing.
+   - Allowed read/process/write overlap instead of materializing all reads first.
+
+2. Output path restructuring
+   - Switched to batch serialization into buffers before write-out.
+   - Reduced fine-grained per-record write overhead.
+
+3. Modifier reuse
+   - Moved `UnconditionalCutter`, `QualityTrimmer`, `NextseqQualityTrimmer`,
+     `NEndTrimmer`, and `Shortener` construction out of the hot per-read loop.
+
+4. Reduced hot-path cloning
+   - Added a lightweight `ModificationInfo` constructor that does not keep a
+     cloned copy of the original read when unnecessary.
+
+5. Parser allocation cleanup
+   - Introduced a `SequenceRecord::from_parts(...)` path so parsed strings could
+     be moved instead of copied again.
+
+6. Parallel gzip writer
+   - Added a parallel gzip writing stage.
+   - Wired `--cores` into the compression path.
+   - Changed the CLI default so `--cores=0` means auto and is the default path.
+
+7. Test stability cleanup
+   - Added a mutex around adapter-name-counter tests to avoid cross-test races.
+
+Files changed in the worktree:
+
+- `README.md`
+- `crates/cutadapt/src/main.rs`
+- `crates/cutadapt-core/src/files.rs`
+- `crates/cutadapt-core/src/info.rs`
+- `crates/cutadapt-core/src/record.rs`
+- `crates/cutadapt-core/src/adapters/mod.rs`
+
+
+Phase 3: Benchmark results after optimization
+---------------------------------------------
+
+Measured on the same workload:
+
+Baseline:
+
+- Python cutadapt 5.2: `1m 07s`
+- Rust baseline at `0ad2e08`: `1m 47s`
+
+Intermediate result after the first optimization round:
+
+- `/dev/null`: `28.93s`
+- gzipped output: `1m01.46s`
+- Peak RSS dropped from roughly `8.5 GB` to roughly `42-51 MB`
+
+Final result after parallel gzip and the completed restructuring:
+
+- gzipped output: `30.59s`
+- `/dev/null`: `28.93s`
+- Peak RSS: about `135 MB`
+
+Interpretation:
+
+- The pipeline and write/compression structure were indeed the major issues.
+- The final runtime was no longer dominated by the same factors as the baseline.
+- This validated the earlier conclusion that directly micro-optimizing the
+  matcher first would have been the wrong priority.
+
+
+Phase 4: Benchmark case for llm-benchmark
+-----------------------------------------
+
+The user then asked to turn this optimization journey into a benchmark case for
+another repository so an LLM could be tested on whether it can infer the same
+optimization strategy from code alone.
+
+Target repository:
+
+- `/home/xzg/project/llm-benchmark`
+
+Created benchmark case:
+
+- `test02/`
+
+Public materials added:
+
+- `test02/public/problem-statement.txt`
+- `test02/public/questions.txt`
+- `test02/artifacts/benchmark-results/baseline-summary.txt`
+- `test02/snapshot/cutadapt-rs-0ad2e08/`
+
+Private grading material:
+
+- `test02/private/answer-key.txt`
+
+Design of the benchmark case:
+
+- The tested model receives only:
+  - the frozen slow-version code snapshot
+  - the public benchmark summary
+  - the task description and constraints
+- It does not receive git history.
+- The private answer key records the expected bottlenecks and the preferred
+  optimization order.
+
+The `llm-benchmark/README.md` file was also updated to mention `test02`.
+
+
+Phase 5: README update in cutadapt-rs
+-------------------------------------
+
+The user asked to update `README.md` so it reflects the optimized result.
+
+Updated benchmark section in the optimization worktree:
+
+- kept the original baseline table for commit `0ad2e08`
+- added the optimized result:
+  - gzipped output: `30.59s`
+  - `/dev/null`: `28.93s`
+  - Peak RSS: `~135 MB`
+- added a short summary of where the gains came from:
+  - batched streaming
+  - batched output writes
+  - modifier reuse
+  - less hot-path cloning
+  - parallel gzip
+
+
+Phase 6: Commit and merge
+-------------------------
+
+The user then asked to commit the optimization work and merge it into `main`.
+
+Actions performed:
+
+1. Re-ran `cargo test -q` in `/tmp/cutadapt-rs-speedopt`
+   - all tests passed
+
+2. Created commit:
+   - Commit: `e0bba81`
+   - Message: `Optimize streaming pipeline and gzip output`
+
+3. Fast-forward merged the optimization branch into `main`
+
+Final git state:
+
+- `main` now points to `e0bba81`
+- `perf/speed-opt-20260410` also points to `e0bba81`
+
+Recent history at the end of the session:
+
+- `e0bba81` Optimize streaming pipeline and gzip output
+- `6839995` Add benchmark results to README (commit 0ad2e08)
+- `0ad2e08` Wire up read processing pipeline in main.rs
+
+
+Notes about unrelated local changes
+-----------------------------------
+
+The main working tree already had unrelated local files and changes before the
+merge step. Those were intentionally not touched.
+
+Examples visible at the end:
+
+- modified `.gitignore`
+- untracked `.codex`
+- untracked `docs/history/claude-code-fix-benchmark.txt`
+- untracked `test_R1.fq.gz`
+- untracked `test_R2.fq.gz`
+
+
+End state
+---------
+
+By the end of this session:
+
+1. The speed optimization had been implemented, benchmarked, tested, committed,
+   and merged into `main`.
+
+2. The benchmark README in `cutadapt-rs` had been updated to show both baseline
+   and optimized performance.
+
+3. A new `llm-benchmark` test case had been created so future LLM runs can be
+   scored on whether they independently identify the same bottlenecks and
+   optimization order from the frozen slow-version code snapshot.
