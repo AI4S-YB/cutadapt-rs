@@ -172,6 +172,13 @@ fn make_kmer_finder(
     adapter_wildcards: bool,
     read_wildcards: bool,
 ) -> KmerFinderEnum {
+    // If the adapter contains non-IUPAC characters (e.g. "ADAPTER" has P, E, D),
+    // the kmer finder cannot generate valid search patterns. Fall back to Mock
+    // (always returns true), matching the Python behavior where ValueError is caught.
+    let iupac_chars = "ABCDGHKMNRSTUVWXY";
+    if !sequence.chars().all(|c| iupac_chars.contains(c)) {
+        return KmerFinderEnum::Mock;
+    }
     let positions_and_kmers = create_positions_and_kmers(
         sequence,
         min_overlap,
@@ -180,9 +187,7 @@ fn make_kmer_finder(
         front_adapter,
         internal,
     );
-    match KmerFinder::new(&positions_and_kmers, adapter_wildcards, read_wildcards) {
-        kf => KmerFinderEnum::Real(kf),
-    }
+    KmerFinderEnum::Real(KmerFinder::new(&positions_and_kmers, adapter_wildcards, read_wildcards))
 }
 
 // ---------------------------------------------------------------------------
