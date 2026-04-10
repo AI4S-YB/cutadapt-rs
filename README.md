@@ -112,6 +112,8 @@ Commit: `0ad2e08`
 
 ### Current main
 
+Commit: `46aa828` (`v5.2`)
+
 Measured with `./test.sh` on the same workload after the streaming pipeline, batched output, hot-path allocation cleanup, multi-threaded read processing, parallel gzip output, and `flate2` backend tuning.
 
 #### thread=1

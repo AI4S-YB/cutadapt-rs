@@ -238,23 +238,230 @@ merge step. Those were intentionally not touched.
 Examples visible at the end:
 
 - modified `.gitignore`
-- untracked `.codex`
-- untracked `docs/history/claude-code-fix-benchmark.txt`
-- untracked `test_R1.fq.gz`
-- untracked `test_R2.fq.gz`
+
+
+Phase 7: Continued optimization on main
+---------------------------------------
+
+After the earlier restructuring merge, optimization continued directly on
+`main` rather than in the temporary worktree.
+
+The next focus was the remaining gap in multi-threaded runs.
+
+New observations from benchmark discussion:
+
+- single-thread performance had become much closer to Python
+- the larger remaining gap showed up mostly in multi-core runs
+- this suggested the next bottlenecks were no longer the original
+  `read_all()` / single-thread gzip issues, but rather:
+  - read-processing parallelism
+  - pipeline scheduling
+  - compression/decompression implementation cost
+  - thread-budget interactions between processing and gzip
+
+Main implementation work done on `main`:
+
+1. Added persistent worker-based read-processing parallelism
+   - moved away from single-threaded batch processing
+   - introduced batch jobs/results with ordered merge on the main thread
+   - preserved output order and summary counters
+
+2. Reworked scheduling and memory behavior
+   - reduced in-flight batch depth
+   - changed worker dispatch to a shared queue model
+   - moved per-batch FASTQ serialization into worker threads so the main
+     thread mostly writes already-serialized buffers
+
+3. Adjusted gzip parallel writer behavior
+   - tuned chunk size and in-flight compression depth
+   - capped compression threads more conservatively
+   - accounted for paired-end output so compression threads are not naively
+     multiplied per output path
+
+Files touched in this phase:
+
+- `Cargo.toml`
+- `Cargo.lock`
+- `crates/cutadapt/src/main.rs`
+- `crates/cutadapt-core/src/files.rs`
+- `README.md`
+
+
+Phase 8: Compression backend experiments
+----------------------------------------
+
+Once the structural and scheduling bottlenecks had been reduced, the session
+continued one level deeper and explicitly examined whether the gzip backend
+itself had become a new performance factor.
+
+Key finding:
+
+- after the earlier pipeline work, input/output compression implementation
+  choice could noticeably affect wall time
+
+Experiment path:
+
+1. Verified that the baseline snapshot and current code used `flate2` for gzip.
+
+2. Switched `flate2` from the default Rust backend to `zlib-rs`.
+
+3. Rebuilt and benchmarked again.
+
+Observed effect:
+
+- multi-threaded wall time improved substantially
+- but output `.gz` files became much larger
+- this made it clear that faster wall time at this stage could come with a
+  compression-ratio tradeoff rather than representing a universally better
+  implementation
+
+Additional experiment:
+
+- `zlib-ng-compat` was also tried as a possible compromise
+- it did not deliver a better overall tradeoff in this local testing
+
+Final decision for the codebase at the end of the session:
+
+- keep the faster `zlib-rs` direction
+- explicitly treat this as a second-stage implementation choice and not as the
+  original baseline root cause
+
+This later became part of the updated `llm-benchmark/test02` grading rubric:
+strong answers should be rewarded if they can identify compression backend
+choice as a second-stage factor, but they should still prioritize the baseline
+structural issues first.
+
+
+Phase 9: Final benchmark state recorded in README
+-------------------------------------------------
+
+The benchmark section in `README.md` was updated again to reflect the latest
+results on `main`.
+
+Current benchmark block recorded in the README:
+
+- Baseline commit: `0ad2e08`
+- Current main / release commit: `46aa828`
+- Tag: `v5.2`
+
+Reported results on the same workload:
+
+thread=1
+
+- Python cutadapt 5.2: `1:02.55`
+- Rust cutadapt-rs: `0:48.33`
+- Peak RSS (Rust): `~60 MB`
+
+thread=6
+
+- Python cutadapt 5.2: `0:19.33`
+- Rust cutadapt-rs: `0:21.11`
+- Peak RSS (Rust): `~226 MB`
+
+Summary included in the README:
+
+- results remain numerically identical
+- gains now come from:
+  - batched streaming
+  - batched output
+  - hot-path allocation cleanup
+  - multi-threaded read processing
+  - parallel gzip output
+  - `flate2` backend tuning
+
+
+Phase 10: test02 benchmark-case upgrade
+---------------------------------------
+
+The `llm-benchmark/test02` case was updated so it no longer stops at the
+first-layer bottlenecks only.
+
+New emphasis added to the benchmark case:
+
+1. The tested LLM should still identify baseline root causes first:
+   - full-input buffering
+   - single-thread gzip/write path
+   - hot-path clone/allocation problems
+
+2. But stronger answers should now also continue into second-stage factors:
+   - parser overhead
+   - input gunzip / output gzip implementation choice
+   - batch scheduling and ordered result collection
+   - processing-thread vs compression-thread budgeting
+   - wall-time vs RSS vs output-size / compression-ratio tradeoffs
+
+Updated files in `/home/xzg/project/llm-benchmark`:
+
+- `README.md`
+- `test02/public/problem-statement.txt`
+- `test02/public/questions.txt`
+- `test02/private/answer-key.txt`
+- `test02/artifacts/benchmark-results/baseline-summary.txt`
+
+The public materials were intentionally kept generic:
+
+- they do not directly name `zlib-rs`
+- they ask whether compression implementation/backend choice could be a
+  second-stage factor
+
+The private answer key now explicitly allows extra credit for answers that can:
+
+- identify compression backend choice as a meaningful later-stage factor
+- explain why it should not outrank the baseline structural issues
+- discuss the tradeoff between wall time and compressed output size
+
+
+Phase 11: Final release commit and push
+---------------------------------------
+
+The final code and README changes were committed on `main` and pushed.
+
+Commit created:
+
+- `46aa828`
+- message: `Improve pipeline parallelism and gzip throughput`
+
+Release/tag state after push:
+
+- `origin/main` -> `46aa828`
+- `v5.2` -> `46aa828` (forced update)
+
+Files intentionally left untracked and not pushed:
+
+- `test.sh`
+- `test_R1.fq.gz`
+- `test_R2.fq.gz`
 
 
 End state
 ---------
 
-By the end of this session:
+By the end of the session, the optimization story had evolved through three
+distinct layers:
 
-1. The speed optimization had been implemented, benchmarked, tested, committed,
-   and merged into `main`.
+1. Baseline structural bottlenecks
+   - `read_all()`
+   - single-thread gzip/write path
+   - heavy hot-path cloning/allocation
 
-2. The benchmark README in `cutadapt-rs` had been updated to show both baseline
-   and optimized performance.
+2. Post-structure throughput work
+   - streaming batches
+   - buffered output
+   - read-processing parallelism
+   - ordered batch merge
+   - compression thread budgeting
 
-3. A new `llm-benchmark` test case had been created so future LLM runs can be
-   scored on whether they independently identify the same bottlenecks and
-   optimization order from the frozen slow-version code snapshot.
+3. Second-stage implementation tuning
+   - `flate2` backend choice
+   - gzip throughput vs output-size tradeoff
+   - benchmark interpretation under different threading setups
+
+The final user-visible state was:
+
+- code committed and pushed at `46aa828`
+- tag `v5.2` force-updated to that commit
+- README refreshed with the latest benchmark numbers
+- `docs/history/codex-speed-up.txt` updated with the full optimization path
+- untracked `test.sh`
+- untracked `test_R1.fq.gz`
+- untracked `test_R2.fq.gz`
