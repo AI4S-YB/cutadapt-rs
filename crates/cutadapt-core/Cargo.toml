@@ -1,0 +1,16 @@
+[package]
+name = "cutadapt-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core library for cutadapt-rs — adapter trimming for sequencing reads"
+
+[dependencies]
+bitflags = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
