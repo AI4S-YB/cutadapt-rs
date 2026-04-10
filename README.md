@@ -110,27 +110,33 @@ Commit: `0ad2e08`
 | R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
 | Total bp written | 2,961,299,044 | 2,961,299,044 |
 
-### After streaming + batched output + parallel gzip
+### Current main
 
-Current optimized worktree on branch `perf/speed-opt-20260410`
+Measured with `./test.sh` on the same workload after the streaming pipeline, batched output, hot-path allocation cleanup, multi-threaded read processing, parallel gzip output, and `flate2` backend tuning.
 
-| | Python cutadapt 5.2 | cutadapt-rs |
+#### thread=1
+
+| Metric | Python cutadapt 5.2 | cutadapt-rs |
 |---|---|---|
-| Time | 1m 07s | 30.59s |
+| Time | 1:02.55 | 0:48.33 |
 | Reads processed | 9,880,559 | 9,880,559 |
 | R1 with adapter | 306,997 (3.1%) | 306,997 (3.1%) |
 | R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
-| Total bp written | 2,961,299,044 | 2,961,299,044 |
-| Peak RSS | n/a | ~135 MB |
+| Total bp written | 2,961,299,044 bp | 2,961,299,044 bp |
+| Peak RSS | n/a | ~60 MB |
 
-Additional breakdown for the optimized worktree:
+#### thread=6
 
-| Mode | Time |
-|---|---|
-| Gzipped FASTQ output | 30.59s |
-| `/dev/null` output | 28.93s |
+| Metric | Python cutadapt 5.2 | cutadapt-rs |
+|---|---|---|
+| Time | 0:19.33 | 0:21.11 |
+| Reads processed | 9,880,559 | 9,880,559 |
+| R1 with adapter | 306,997 (3.1%) | 306,997 (3.1%) |
+| R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
+| Total bp written | 2,961,299,044 bp | 2,961,299,044 bp |
+| Peak RSS | n/a | ~226 MB |
 
-Results remain numerically identical. The main gains came from replacing `read_all()` with batched streaming, batching output writes, reusing modifiers outside the per-read loop, reducing hot-path cloning, and parallelizing gzip output.
+Results remain numerically identical. Compared with the `0ad2e08` baseline, the main gains came from replacing `read_all()` with batched streaming, batching output writes, reusing modifiers outside the per-read loop, reducing hot-path cloning, parallelizing gzip output, parallelizing read processing, and tuning the gzip backend.
 
 ## Testing
 

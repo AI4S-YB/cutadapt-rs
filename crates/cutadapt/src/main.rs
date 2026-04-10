@@ -1,7 +1,10 @@
 use anyhow::{bail, Result};
 use clap::Parser;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use cutadapt_core::files::{FileFormat, FileOpener, InputPaths};
 use cutadapt_core::info::ModificationInfo;
@@ -14,6 +17,7 @@ use cutadapt_core::record::SequenceRecord;
 use cutadapt_core::steps::PairFilterMode;
 
 const RECORD_BATCH_SIZE: usize = 16_384;
+const PROCESSING_QUEUE_CAPACITY: usize = 1;
 
 fn requested_threads(cores: i32) -> usize {
     if cores == 0 {
@@ -23,6 +27,499 @@ fn requested_threads(cores: i32) -> usize {
     } else {
         cores.max(1) as usize
     }
+}
+
+fn compression_threads(cores: i32, output_count: usize) -> usize {
+    let total = requested_threads(cores).min(4).max(1);
+    let outputs = output_count.max(1);
+    total.div_ceil(outputs).max(1)
+}
+
+fn build_adapters_from_owned_specs(
+    specs: &[(AdapterType, String)],
+    search_params: &SearchParameters,
+) -> Vec<cutadapt_core::adapters::Adapter> {
+    let spec_refs: Vec<(AdapterType, &str)> = specs
+        .iter()
+        .map(|(adapter_type, spec)| (*adapter_type, spec.as_str()))
+        .collect();
+    make_adapters_from_specifications(&spec_refs, search_params)
+        .expect("adapter specifications were validated before processing")
+}
+
+#[derive(Clone)]
+struct SingleProcessingConfig {
+    adapter_specs: Vec<(AdapterType, String)>,
+    search_params: SearchParameters,
+    times: usize,
+    cuts: Vec<i32>,
+    nextseq_trim: Option<i32>,
+    qual_cutoff: Option<(u8, u8)>,
+    quality_base: i32,
+    trim_n: bool,
+    length: Option<i32>,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+    max_n: Option<f64>,
+}
+
+struct SingleProcessResult {
+    record: Option<SequenceRecord>,
+    had_adapter: bool,
+}
+
+struct SingleBatchJob {
+    sequence: usize,
+    records: Vec<SequenceRecord>,
+}
+
+struct SingleBatchResult {
+    sequence: usize,
+    output: Vec<u8>,
+    n_written: u64,
+    bp_out: u64,
+    reads_with_adapter: u64,
+}
+
+struct SingleProcessingWorker {
+    trimmer: AdapterTrimmer,
+    cutters: Vec<UnconditionalCutter>,
+    nextseq_trimmer: Option<NextseqQualityTrimmer>,
+    quality_trimmer: Option<QualityTrimmer>,
+    n_end_trimmer: Option<NEndTrimmer>,
+    shortener: Option<Shortener>,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+    max_n: Option<f64>,
+}
+
+impl SingleProcessingWorker {
+    fn new(config: &SingleProcessingConfig) -> Self {
+        Self {
+            trimmer: AdapterTrimmer::new(
+                build_adapters_from_owned_specs(&config.adapter_specs, &config.search_params),
+                config.times,
+            ),
+            cutters: config
+                .cuts
+                .iter()
+                .copied()
+                .map(UnconditionalCutter::new)
+                .collect(),
+            nextseq_trimmer: config
+                .nextseq_trim
+                .map(|cutoff| NextseqQualityTrimmer::new(cutoff, config.quality_base)),
+            quality_trimmer: if config.nextseq_trim.is_none() {
+                config
+                    .qual_cutoff
+                    .filter(|(five, three)| *five > 0 || *three > 0)
+                    .map(|(five, three)| {
+                        QualityTrimmer::new(five as i32, three as i32, config.quality_base)
+                    })
+            } else {
+                None
+            },
+            n_end_trimmer: config.trim_n.then(NEndTrimmer::new),
+            shortener: config.length.map(Shortener::new),
+            min_len: config.min_len,
+            max_len: config.max_len,
+            max_n: config.max_n,
+        }
+    }
+
+    fn process(&mut self, record: SequenceRecord) -> SingleProcessResult {
+        let mut info = ModificationInfo::without_original();
+        let mut read = record;
+
+        for cutter in &mut self.cutters {
+            read = cutter.modify(read, &mut info);
+        }
+
+        if let Some(ref mut qt) = self.nextseq_trimmer {
+            read = qt.modify(read, &mut info);
+        } else if let Some(ref mut qt) = self.quality_trimmer {
+            read = qt.modify(read, &mut info);
+        }
+
+        read = self.trimmer.modify(read, &mut info);
+        let had_adapter = !info.matches.is_empty();
+
+        if let Some(ref mut nt) = self.n_end_trimmer {
+            read = nt.modify(read, &mut info);
+        }
+        if let Some(ref mut sh) = self.shortener {
+            read = sh.modify(read, &mut info);
+        }
+
+        let record = if check_filters(&read, self.min_len, self.max_len, self.max_n) {
+            None
+        } else {
+            Some(read)
+        };
+
+        SingleProcessResult { record, had_adapter }
+    }
+}
+
+#[derive(Clone)]
+struct PairedProcessingConfig {
+    adapter_specs1: Vec<(AdapterType, String)>,
+    adapter_specs2: Vec<(AdapterType, String)>,
+    search_params: SearchParameters,
+    times: usize,
+    cuts1: Vec<i32>,
+    cuts2: Vec<i32>,
+    nextseq_trim: Option<i32>,
+    qual_cutoff1: Option<(u8, u8)>,
+    qual_cutoff2: Option<(u8, u8)>,
+    quality_base: i32,
+    trim_n: bool,
+    length1: Option<i32>,
+    length2: Option<i32>,
+    pair_filter_mode: PairFilterMode,
+    min_len1: Option<usize>,
+    min_len2: Option<usize>,
+    max_len1: Option<usize>,
+    max_len2: Option<usize>,
+    max_n: Option<f64>,
+}
+
+struct PairedProcessResult {
+    records: Option<(SequenceRecord, SequenceRecord)>,
+    had_adapter1: bool,
+    had_adapter2: bool,
+}
+
+struct PairedBatchJob {
+    sequence: usize,
+    records1: Vec<SequenceRecord>,
+    records2: Vec<SequenceRecord>,
+}
+
+struct PairedBatchResult {
+    sequence: usize,
+    output1: Vec<u8>,
+    output2: Vec<u8>,
+    n_written: u64,
+    bp_out1: u64,
+    bp_out2: u64,
+    reads_with_adapter1: u64,
+    reads_with_adapter2: u64,
+}
+
+struct PairedProcessingWorker {
+    trimmer1: AdapterTrimmer,
+    trimmer2: AdapterTrimmer,
+    cutters1: Vec<UnconditionalCutter>,
+    cutters2: Vec<UnconditionalCutter>,
+    nextseq_trimmer: Option<NextseqQualityTrimmer>,
+    quality_trimmer1: Option<QualityTrimmer>,
+    quality_trimmer2: Option<QualityTrimmer>,
+    n_end_trimmer: Option<NEndTrimmer>,
+    shortener1: Option<Shortener>,
+    shortener2: Option<Shortener>,
+    pair_filter_mode: PairFilterMode,
+    min_len1: Option<usize>,
+    min_len2: Option<usize>,
+    max_len1: Option<usize>,
+    max_len2: Option<usize>,
+    max_n: Option<f64>,
+}
+
+impl PairedProcessingWorker {
+    fn new(config: &PairedProcessingConfig) -> Self {
+        Self {
+            trimmer1: AdapterTrimmer::new(
+                build_adapters_from_owned_specs(&config.adapter_specs1, &config.search_params),
+                config.times,
+            ),
+            trimmer2: AdapterTrimmer::new(
+                build_adapters_from_owned_specs(&config.adapter_specs2, &config.search_params),
+                config.times,
+            ),
+            cutters1: config
+                .cuts1
+                .iter()
+                .copied()
+                .map(UnconditionalCutter::new)
+                .collect(),
+            cutters2: config
+                .cuts2
+                .iter()
+                .copied()
+                .map(UnconditionalCutter::new)
+                .collect(),
+            nextseq_trimmer: config
+                .nextseq_trim
+                .map(|cutoff| NextseqQualityTrimmer::new(cutoff, config.quality_base)),
+            quality_trimmer1: if config.nextseq_trim.is_none() {
+                config
+                    .qual_cutoff1
+                    .filter(|(five, three)| *five > 0 || *three > 0)
+                    .map(|(five, three)| {
+                        QualityTrimmer::new(five as i32, three as i32, config.quality_base)
+                    })
+            } else {
+                None
+            },
+            quality_trimmer2: if config.nextseq_trim.is_none() {
+                config
+                    .qual_cutoff2
+                    .filter(|(five, three)| *five > 0 || *three > 0)
+                    .map(|(five, three)| {
+                        QualityTrimmer::new(five as i32, three as i32, config.quality_base)
+                    })
+            } else {
+                None
+            },
+            n_end_trimmer: config.trim_n.then(NEndTrimmer::new),
+            shortener1: config.length1.map(Shortener::new),
+            shortener2: config.length2.map(Shortener::new),
+            pair_filter_mode: config.pair_filter_mode,
+            min_len1: config.min_len1,
+            min_len2: config.min_len2,
+            max_len1: config.max_len1,
+            max_len2: config.max_len2,
+            max_n: config.max_n,
+        }
+    }
+
+    fn process(
+        &mut self,
+        r1_orig: SequenceRecord,
+        r2_orig: SequenceRecord,
+    ) -> PairedProcessResult {
+        let mut info1 = ModificationInfo::without_original();
+        let mut info2 = ModificationInfo::without_original();
+        let mut r1 = r1_orig;
+        let mut r2 = r2_orig;
+
+        for cutter in &mut self.cutters1 {
+            r1 = cutter.modify(r1, &mut info1);
+        }
+        for cutter in &mut self.cutters2 {
+            r2 = cutter.modify(r2, &mut info2);
+        }
+
+        if let Some(ref mut qt) = self.nextseq_trimmer {
+            r1 = qt.modify(r1, &mut info1);
+            r2 = qt.modify(r2, &mut info2);
+        } else {
+            if let Some(ref mut qt) = self.quality_trimmer1 {
+                r1 = qt.modify(r1, &mut info1);
+            }
+            if let Some(ref mut qt) = self.quality_trimmer2 {
+                r2 = qt.modify(r2, &mut info2);
+            }
+        }
+
+        r1 = self.trimmer1.modify(r1, &mut info1);
+        r2 = self.trimmer2.modify(r2, &mut info2);
+        let had_adapter1 = !info1.matches.is_empty();
+        let had_adapter2 = !info2.matches.is_empty();
+
+        if let Some(ref mut nt) = self.n_end_trimmer {
+            r1 = nt.modify(r1, &mut info1);
+            r2 = nt.modify(r2, &mut info2);
+        }
+        if let Some(ref mut sh) = self.shortener1 {
+            r1 = sh.modify(r1, &mut info1);
+        }
+        if let Some(ref mut sh) = self.shortener2 {
+            r2 = sh.modify(r2, &mut info2);
+        }
+
+        let filter1 = check_filters(&r1, self.min_len1, self.max_len1, self.max_n);
+        let filter2 = check_filters(&r2, self.min_len2, self.max_len2, self.max_n);
+        let discard = match self.pair_filter_mode {
+            PairFilterMode::Any => filter1 || filter2,
+            PairFilterMode::Both => filter1 && filter2,
+            PairFilterMode::First => filter1,
+        };
+
+        let records = if discard { None } else { Some((r1, r2)) };
+
+        PairedProcessResult {
+            records,
+            had_adapter1,
+            had_adapter2,
+        }
+    }
+}
+
+fn process_single_batch(
+    records: Vec<SequenceRecord>,
+    worker: &mut SingleProcessingWorker,
+    format: FileFormat,
+    output_buffer_hint: usize,
+) -> (Vec<u8>, u64, u64, u64) {
+    let mut output = Vec::with_capacity(output_buffer_hint);
+    let mut n_written = 0u64;
+    let mut bp_out = 0u64;
+    let mut reads_with_adapter = 0u64;
+
+    for record in records {
+        let result = worker.process(record);
+        reads_with_adapter += result.had_adapter as u64;
+        let Some(record) = result.record else {
+            continue;
+        };
+        bp_out += record.len() as u64;
+        n_written += 1;
+        append_record(&mut output, &record, format);
+    }
+
+    (output, n_written, bp_out, reads_with_adapter)
+}
+
+fn process_paired_batch(
+    records1: Vec<SequenceRecord>,
+    records2: Vec<SequenceRecord>,
+    worker: &mut PairedProcessingWorker,
+    format: FileFormat,
+    output_buffer_hint: usize,
+) -> (Vec<u8>, Vec<u8>, u64, u64, u64, u64, u64) {
+    let mut output1 = Vec::with_capacity(output_buffer_hint);
+    let mut output2 = Vec::with_capacity(output_buffer_hint);
+    let mut n_written = 0u64;
+    let mut bp_out1 = 0u64;
+    let mut bp_out2 = 0u64;
+    let mut reads_with_adapter1 = 0u64;
+    let mut reads_with_adapter2 = 0u64;
+
+    for (r1, r2) in records1.into_iter().zip(records2) {
+        let result = worker.process(r1, r2);
+        reads_with_adapter1 += result.had_adapter1 as u64;
+        reads_with_adapter2 += result.had_adapter2 as u64;
+        let Some((r1, r2)) = result.records else {
+            continue;
+        };
+        bp_out1 += r1.len() as u64;
+        bp_out2 += r2.len() as u64;
+        n_written += 1;
+        append_record(&mut output1, &r1, format);
+        append_record(&mut output2, &r2, format);
+    }
+
+    (
+        output1,
+        output2,
+        n_written,
+        bp_out1,
+        bp_out2,
+        reads_with_adapter1,
+        reads_with_adapter2,
+    )
+}
+
+fn spawn_single_workers(
+    worker_count: usize,
+    config: &SingleProcessingConfig,
+    format: FileFormat,
+    output_buffer_hint: usize,
+) -> (
+    mpsc::SyncSender<Option<SingleBatchJob>>,
+    mpsc::Receiver<SingleBatchResult>,
+    Vec<JoinHandle<()>>,
+) {
+    let mut handles = Vec::with_capacity(worker_count);
+    let (sender, receiver) = mpsc::sync_channel::<Option<SingleBatchJob>>(PROCESSING_QUEUE_CAPACITY);
+    let (result_sender, result_receiver) = mpsc::channel::<SingleBatchResult>();
+    let shared_receiver = Arc::new(Mutex::new(receiver));
+
+    for _ in 0..worker_count {
+        let receiver = Arc::clone(&shared_receiver);
+        let result_sender = result_sender.clone();
+        let worker_config = config.clone();
+        let handle = thread::spawn(move || {
+            let mut worker = SingleProcessingWorker::new(&worker_config);
+            while let Ok(job) = receiver.lock().unwrap().recv() {
+                let Some(job) = job else {
+                    break;
+                };
+                let (output, n_written, bp_out, reads_with_adapter) =
+                    process_single_batch(job.records, &mut worker, format, output_buffer_hint);
+                if result_sender
+                    .send(SingleBatchResult {
+                        sequence: job.sequence,
+                        output,
+                        n_written,
+                        bp_out,
+                        reads_with_adapter,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    (sender, result_receiver, handles)
+}
+
+fn spawn_paired_workers(
+    worker_count: usize,
+    config: &PairedProcessingConfig,
+    format: FileFormat,
+    output_buffer_hint: usize,
+) -> (
+    mpsc::SyncSender<Option<PairedBatchJob>>,
+    mpsc::Receiver<PairedBatchResult>,
+    Vec<JoinHandle<()>>,
+) {
+    let mut handles = Vec::with_capacity(worker_count);
+    let (sender, receiver) = mpsc::sync_channel::<Option<PairedBatchJob>>(PROCESSING_QUEUE_CAPACITY);
+    let (result_sender, result_receiver) = mpsc::channel::<PairedBatchResult>();
+    let shared_receiver = Arc::new(Mutex::new(receiver));
+
+    for _ in 0..worker_count {
+        let receiver = Arc::clone(&shared_receiver);
+        let result_sender = result_sender.clone();
+        let worker_config = config.clone();
+        let handle = thread::spawn(move || {
+            let mut worker = PairedProcessingWorker::new(&worker_config);
+            while let Ok(job) = receiver.lock().unwrap().recv() {
+                let Some(job) = job else {
+                    break;
+                };
+                let (
+                    output1,
+                    output2,
+                    n_written,
+                    bp_out1,
+                    bp_out2,
+                    reads_with_adapter1,
+                    reads_with_adapter2,
+                ) = process_paired_batch(
+                    job.records1,
+                    job.records2,
+                    &mut worker,
+                    format,
+                    output_buffer_hint,
+                );
+                if result_sender
+                    .send(PairedBatchResult {
+                        sequence: job.sequence,
+                        output1,
+                        output2,
+                        n_written,
+                        bp_out1,
+                        bp_out2,
+                        reads_with_adapter1,
+                        reads_with_adapter2,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    (sender, result_receiver, handles)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1418,7 @@ fn main() -> Result<()> {
 
 fn run_pipeline(cli: &Cli) -> Result<()> {
     let paired = cli.is_paired();
+    let processing_threads = requested_threads(cli.cores);
 
     // ── Build search parameters ──────────────────────────────────────────
     let search_params = SearchParameters {
@@ -932,27 +1430,37 @@ fn run_pipeline(cli: &Cli) -> Result<()> {
     };
 
     // ── Build adapters ───────────────────────────────────────────────────
-    let adapter_specs1: Vec<(AdapterType, &str)> = cli
-        .back_adapters.iter().map(|s| (AdapterType::Back, s.as_str()))
-        .chain(cli.front_adapters.iter().map(|s| (AdapterType::Front, s.as_str())))
-        .chain(cli.anywhere_adapters.iter().map(|s| (AdapterType::Anywhere, s.as_str())))
+    let adapter_specs1: Vec<(AdapterType, String)> = cli
+        .back_adapters.iter().map(|s| (AdapterType::Back, s.clone()))
+        .chain(cli.front_adapters.iter().map(|s| (AdapterType::Front, s.clone())))
+        .chain(cli.anywhere_adapters.iter().map(|s| (AdapterType::Anywhere, s.clone())))
         .collect();
 
-    let adapter_specs2: Vec<(AdapterType, &str)> = cli
-        .back_adapters2.iter().map(|s| (AdapterType::Back, s.as_str()))
-        .chain(cli.front_adapters2.iter().map(|s| (AdapterType::Front, s.as_str())))
-        .chain(cli.anywhere_adapters2.iter().map(|s| (AdapterType::Anywhere, s.as_str())))
+    let adapter_specs2: Vec<(AdapterType, String)> = cli
+        .back_adapters2.iter().map(|s| (AdapterType::Back, s.clone()))
+        .chain(cli.front_adapters2.iter().map(|s| (AdapterType::Front, s.clone())))
+        .chain(cli.anywhere_adapters2.iter().map(|s| (AdapterType::Anywhere, s.clone())))
         .collect();
 
-    let adapters1 = make_adapters_from_specifications(&adapter_specs1, &search_params)
+    let adapter_specs1_refs: Vec<(AdapterType, &str)> = adapter_specs1
+        .iter()
+        .map(|(adapter_type, spec)| (*adapter_type, spec.as_str()))
+        .collect();
+    let adapter_specs2_refs: Vec<(AdapterType, &str)> = adapter_specs2
+        .iter()
+        .map(|(adapter_type, spec)| (*adapter_type, spec.as_str()))
+        .collect();
+
+    make_adapters_from_specifications(&adapter_specs1_refs, &search_params)
         .map_err(|e| anyhow::anyhow!("Adapter parse error (R1): {e}"))?;
-    let adapters2 = make_adapters_from_specifications(&adapter_specs2, &search_params)
+    make_adapters_from_specifications(&adapter_specs2_refs, &search_params)
         .map_err(|e| anyhow::anyhow!("Adapter parse error (R2): {e}"))?;
 
     // ── Read input ───────────────────────────────────────────────────────
+    let output_count = if paired { 2 } else { 1 };
     let opener = FileOpener::new(
         cli.compression_level as i32,
-        Some(requested_threads(cli.cores)),
+        Some(compression_threads(cli.cores, output_count)),
     )
         .with_buffer_size(cli.buffer_size);
 
@@ -991,14 +1499,15 @@ fn run_pipeline(cli: &Cli) -> Result<()> {
     let (n_reads, n_written, bp_in1, bp_in2, bp_out1, bp_out2,
          reads_with_adapter1, reads_with_adapter2) = if paired {
         run_paired(
-            cli, &mut input_files, adapters1, adapters2,
-            &opener, format,
+            cli, &mut input_files, adapter_specs1, adapter_specs2,
+            &search_params, processing_threads, &opener, format,
             qual_cutoff1, qual_cutoff2, quality_base,
             pair_filter_mode, min_len1, min_len2, max_len1, max_len2,
         )?
     } else {
         run_single_direct(
-            cli, &mut input_files, adapters1, &opener, format,
+            cli, &mut input_files, adapter_specs1, &search_params, processing_threads,
+            &opener, format,
             qual_cutoff1, quality_base,
             min_len1, max_len1,
         )?
@@ -1019,7 +1528,9 @@ fn run_pipeline(cli: &Cli) -> Result<()> {
 fn run_single_direct(
     cli: &Cli,
     input_files: &mut cutadapt_core::files::InputFiles,
-    adapters1: Vec<cutadapt_core::adapters::Adapter>,
+    adapter_specs1: Vec<(AdapterType, String)>,
+    search_params: &SearchParameters,
+    processing_threads: usize,
     opener: &FileOpener,
     format: FileFormat,
     qual_cutoff: Option<(u8, u8)>,
@@ -1027,92 +1538,123 @@ fn run_single_direct(
     min_len: Option<usize>,
     max_len: Option<usize>,
 ) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
-    let mut trimmer = AdapterTrimmer::new(adapters1, cli.times);
-    let mut cutters: Vec<UnconditionalCutter> =
-        cli.cut.iter().copied().map(UnconditionalCutter::new).collect();
-    let mut nextseq_trimmer = cli
-        .nextseq_trim
-        .map(|cutoff| NextseqQualityTrimmer::new(cutoff as i32, quality_base));
-    let mut quality_trimmer = if cli.nextseq_trim.is_none() {
-        qual_cutoff
-            .filter(|(five, three)| *five > 0 || *three > 0)
-            .map(|(five, three)| QualityTrimmer::new(five as i32, three as i32, quality_base))
-    } else {
-        None
+    let processing_config = SingleProcessingConfig {
+        adapter_specs: adapter_specs1,
+        search_params: search_params.clone(),
+        times: cli.times,
+        cuts: cli.cut.clone(),
+        nextseq_trim: cli.nextseq_trim.map(|cutoff| cutoff as i32),
+        qual_cutoff,
+        quality_base,
+        trim_n: cli.trim_n,
+        length: cli.length,
+        min_len,
+        max_len,
+        max_n: cli.max_n,
     };
-    let mut n_end_trimmer = cli.trim_n.then(NEndTrimmer::new);
-    let mut shortener = cli.length.map(Shortener::new);
 
     let output_path = cli.output.as_deref().unwrap_or("-");
     let mut writer = opener.open_write(output_path)?;
-    let output_buffer_limit = cli.buffer_size.max(8 * 1024);
-    let mut output_buffer = Vec::with_capacity(output_buffer_limit);
+    let output_buffer_hint = cli.buffer_size.max(8 * 1024);
 
     let mut n_reads: u64 = 0;
     let mut bp_in1: u64 = 0;
     let mut n_written: u64 = 0;
     let mut bp_out1: u64 = 0;
+    let mut reads_with_adapter1: u64 = 0;
+    let worker_count = processing_threads.max(1);
 
-    loop {
-        let records = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
-        if records.is_empty() {
-            break;
-        }
-
-        for record in records {
-            n_reads += 1;
-            bp_in1 += record.len() as u64;
-
-            let mut info = ModificationInfo::without_original();
-            let mut r = record;
-
-            for cutter in &mut cutters {
-                r = cutter.modify(r, &mut info);
+    if worker_count <= 1 {
+        let mut worker = SingleProcessingWorker::new(&processing_config);
+        loop {
+            let records = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
+            if records.is_empty() {
+                break;
             }
 
-            if let Some(ref mut qt) = nextseq_trimmer {
-                r = qt.modify(r, &mut info);
-            } else if let Some(ref mut qt) = quality_trimmer {
-                r = qt.modify(r, &mut info);
-            }
+            n_reads += records.len() as u64;
+            bp_in1 += records.iter().map(|record| record.len() as u64).sum::<u64>();
 
-            r = trimmer.modify(r, &mut info);
-
-            if let Some(ref mut nt) = n_end_trimmer {
-                r = nt.modify(r, &mut info);
-            }
-            if let Some(ref mut sh) = shortener {
-                r = sh.modify(r, &mut info);
-            }
-
-            if check_filters(&r, min_len, max_len, cli.max_n) {
-                continue;
-            }
-
-            bp_out1 += r.len() as u64;
-            n_written += 1;
-            append_record(&mut output_buffer, &r, format);
-            if output_buffer.len() >= output_buffer_limit {
-                writer.write_all(&output_buffer)?;
-                output_buffer.clear();
+            let (output, batch_n_written, batch_bp_out, batch_reads_with_adapter) =
+                process_single_batch(records, &mut worker, format, output_buffer_hint);
+            reads_with_adapter1 += batch_reads_with_adapter;
+            bp_out1 += batch_bp_out;
+            n_written += batch_n_written;
+            if !output.is_empty() {
+                writer.write_all(&output)?;
             }
         }
-    }
-    if !output_buffer.is_empty() {
-        writer.write_all(&output_buffer)?;
+    } else {
+        let (sender, result_receiver, workers) =
+            spawn_single_workers(worker_count, &processing_config, format, output_buffer_hint);
+        let max_in_flight = worker_count + PROCESSING_QUEUE_CAPACITY;
+        let mut next_batch = 0usize;
+        let mut next_write = 0usize;
+        let mut in_flight = 0usize;
+        let mut eof = false;
+        let mut pending = BTreeMap::<usize, SingleBatchResult>::new();
+
+        loop {
+            while !eof && in_flight < max_in_flight {
+                let records = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
+                if records.is_empty() {
+                    eof = true;
+                    break;
+                }
+                n_reads += records.len() as u64;
+                bp_in1 += records.iter().map(|record| record.len() as u64).sum::<u64>();
+                sender
+                    .send(Some(SingleBatchJob {
+                        sequence: next_batch,
+                        records,
+                    }))
+                    .map_err(|_| anyhow::anyhow!("single-end worker channel closed"))?;
+                next_batch += 1;
+                in_flight += 1;
+            }
+
+            if in_flight == 0 {
+                break;
+            }
+
+            let batch = result_receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("single-end worker result channel closed"))?;
+            pending.insert(batch.sequence, batch);
+
+            while let Some(batch) = pending.remove(&next_write) {
+                in_flight -= 1;
+                next_write += 1;
+                reads_with_adapter1 += batch.reads_with_adapter;
+                bp_out1 += batch.bp_out;
+                n_written += batch.n_written;
+                if !batch.output.is_empty() {
+                    writer.write_all(&batch.output)?;
+                }
+            }
+        }
+
+        for _ in 0..worker_count {
+            let _ = sender.send(None);
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
     writer.flush()?;
 
     Ok((n_reads, n_written, bp_in1, 0, bp_out1, 0,
-        trimmer.reads_with_adapter, 0))
+        reads_with_adapter1, 0))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_paired(
     cli: &Cli,
     input_files: &mut cutadapt_core::files::InputFiles,
-    adapters1: Vec<cutadapt_core::adapters::Adapter>,
-    adapters2: Vec<cutadapt_core::adapters::Adapter>,
+    adapter_specs1: Vec<(AdapterType, String)>,
+    adapter_specs2: Vec<(AdapterType, String)>,
+    search_params: &SearchParameters,
+    processing_threads: usize,
     opener: &FileOpener,
     format: FileFormat,
     qual_cutoff1: Option<(u8, u8)>,
@@ -1124,40 +1666,33 @@ fn run_paired(
     max_len1: Option<usize>,
     max_len2: Option<usize>,
 ) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
-    let mut trimmer1 = AdapterTrimmer::new(adapters1, cli.times);
-    let mut trimmer2 = AdapterTrimmer::new(adapters2, cli.times);
-    let mut cutters1: Vec<UnconditionalCutter> =
-        cli.cut.iter().copied().map(UnconditionalCutter::new).collect();
-    let mut cutters2: Vec<UnconditionalCutter> =
-        cli.cut2.iter().copied().map(UnconditionalCutter::new).collect();
-    let mut nextseq_trimmer = cli
-        .nextseq_trim
-        .map(|cutoff| NextseqQualityTrimmer::new(cutoff as i32, quality_base));
-    let mut quality_trimmer1 = if cli.nextseq_trim.is_none() {
-        qual_cutoff1
-            .filter(|(five, three)| *five > 0 || *three > 0)
-            .map(|(five, three)| QualityTrimmer::new(five as i32, three as i32, quality_base))
-    } else {
-        None
+    let processing_config = PairedProcessingConfig {
+        adapter_specs1,
+        adapter_specs2,
+        search_params: search_params.clone(),
+        times: cli.times,
+        cuts1: cli.cut.clone(),
+        cuts2: cli.cut2.clone(),
+        nextseq_trim: cli.nextseq_trim.map(|cutoff| cutoff as i32),
+        qual_cutoff1,
+        qual_cutoff2,
+        quality_base,
+        trim_n: cli.trim_n,
+        length1: cli.length,
+        length2: cli.length2.or(cli.length),
+        pair_filter_mode,
+        min_len1,
+        min_len2,
+        max_len1,
+        max_len2,
+        max_n: cli.max_n,
     };
-    let mut quality_trimmer2 = if cli.nextseq_trim.is_none() {
-        qual_cutoff2
-            .filter(|(five, three)| *five > 0 || *three > 0)
-            .map(|(five, three)| QualityTrimmer::new(five as i32, three as i32, quality_base))
-    } else {
-        None
-    };
-    let mut n_end_trimmer = cli.trim_n.then(NEndTrimmer::new);
-    let mut shortener1 = cli.length.map(Shortener::new);
-    let mut shortener2 = cli.length2.or(cli.length).map(Shortener::new);
 
     let out1_path = cli.output.as_deref().unwrap_or("-");
     let out2_path = cli.paired_output.as_deref().unwrap_or("-");
     let mut writer1 = opener.open_write(out1_path)?;
     let mut writer2 = opener.open_write(out2_path)?;
-    let output_buffer_limit = cli.buffer_size.max(8 * 1024);
-    let mut output_buffer1 = Vec::with_capacity(output_buffer_limit);
-    let mut output_buffer2 = Vec::with_capacity(output_buffer_limit);
+    let output_buffer_hint = cli.buffer_size.max(8 * 1024);
 
     let mut n_reads: u64 = 0;
     let mut bp_in1: u64 = 0;
@@ -1165,98 +1700,122 @@ fn run_paired(
     let mut n_written: u64 = 0;
     let mut bp_out1: u64 = 0;
     let mut bp_out2: u64 = 0;
+    let mut reads_with_adapter1: u64 = 0;
+    let mut reads_with_adapter2: u64 = 0;
+    let worker_count = processing_threads.max(1);
 
-    loop {
-        let records1 = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
-        if records1.is_empty() {
-            break;
-        }
-        let records2 = input_files.read_batch(1, RECORD_BATCH_SIZE)?;
-        if records1.len() != records2.len() {
-            bail!("Paired-end input files contain different numbers of records");
-        }
-
-        for (r1_orig, r2_orig) in records1.into_iter().zip(records2.into_iter()) {
-            n_reads += 1;
-            bp_in1 += r1_orig.len() as u64;
-            bp_in2 += r2_orig.len() as u64;
-
-            let mut info1 = ModificationInfo::without_original();
-            let mut info2 = ModificationInfo::without_original();
-            let mut r1 = r1_orig;
-            let mut r2 = r2_orig;
-
-            for c in &mut cutters1 {
-                r1 = c.modify(r1, &mut info1);
+    if worker_count <= 1 {
+        let mut worker = PairedProcessingWorker::new(&processing_config);
+        loop {
+            let records1 = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
+            if records1.is_empty() {
+                break;
             }
-            for c in &mut cutters2 {
-                r2 = c.modify(r2, &mut info2);
+            let records2 = input_files.read_batch(1, RECORD_BATCH_SIZE)?;
+            if records1.len() != records2.len() {
+                bail!("Paired-end input files contain different numbers of records");
             }
 
-            if let Some(ref mut qt) = nextseq_trimmer {
-                r1 = qt.modify(r1, &mut info1);
-                r2 = qt.modify(r2, &mut info2);
-            } else {
-                if let Some(ref mut qt) = quality_trimmer1 {
-                    r1 = qt.modify(r1, &mut info1);
+            n_reads += records1.len() as u64;
+            bp_in1 += records1.iter().map(|record| record.len() as u64).sum::<u64>();
+            bp_in2 += records2.iter().map(|record| record.len() as u64).sum::<u64>();
+
+            let (
+                output1,
+                output2,
+                batch_n_written,
+                batch_bp_out1,
+                batch_bp_out2,
+                batch_reads_with_adapter1,
+                batch_reads_with_adapter2,
+            ) = process_paired_batch(records1, records2, &mut worker, format, output_buffer_hint);
+            reads_with_adapter1 += batch_reads_with_adapter1;
+            reads_with_adapter2 += batch_reads_with_adapter2;
+            bp_out1 += batch_bp_out1;
+            bp_out2 += batch_bp_out2;
+            n_written += batch_n_written;
+            if !output1.is_empty() {
+                writer1.write_all(&output1)?;
+            }
+            if !output2.is_empty() {
+                writer2.write_all(&output2)?;
+            }
+        }
+    } else {
+        let (sender, result_receiver, workers) =
+            spawn_paired_workers(worker_count, &processing_config, format, output_buffer_hint);
+        let max_in_flight = worker_count + PROCESSING_QUEUE_CAPACITY;
+        let mut next_batch = 0usize;
+        let mut next_write = 0usize;
+        let mut in_flight = 0usize;
+        let mut eof = false;
+        let mut pending = BTreeMap::<usize, PairedBatchResult>::new();
+
+        loop {
+            while !eof && in_flight < max_in_flight {
+                let records1 = input_files.read_batch(0, RECORD_BATCH_SIZE)?;
+                if records1.is_empty() {
+                    eof = true;
+                    break;
                 }
-                if let Some(ref mut qt) = quality_trimmer2 {
-                    r2 = qt.modify(r2, &mut info2);
+                let records2 = input_files.read_batch(1, RECORD_BATCH_SIZE)?;
+                if records1.len() != records2.len() {
+                    bail!("Paired-end input files contain different numbers of records");
+                }
+
+                n_reads += records1.len() as u64;
+                bp_in1 += records1.iter().map(|record| record.len() as u64).sum::<u64>();
+                bp_in2 += records2.iter().map(|record| record.len() as u64).sum::<u64>();
+
+                sender
+                    .send(Some(PairedBatchJob {
+                        sequence: next_batch,
+                        records1,
+                        records2,
+                    }))
+                    .map_err(|_| anyhow::anyhow!("paired-end worker channel closed"))?;
+                next_batch += 1;
+                in_flight += 1;
+            }
+
+            if in_flight == 0 {
+                break;
+            }
+
+            let batch = result_receiver
+                .recv()
+                .map_err(|_| anyhow::anyhow!("paired-end worker result channel closed"))?;
+            pending.insert(batch.sequence, batch);
+
+            while let Some(batch) = pending.remove(&next_write) {
+                in_flight -= 1;
+                next_write += 1;
+                reads_with_adapter1 += batch.reads_with_adapter1;
+                reads_with_adapter2 += batch.reads_with_adapter2;
+                bp_out1 += batch.bp_out1;
+                bp_out2 += batch.bp_out2;
+                n_written += batch.n_written;
+                if !batch.output1.is_empty() {
+                    writer1.write_all(&batch.output1)?;
+                }
+                if !batch.output2.is_empty() {
+                    writer2.write_all(&batch.output2)?;
                 }
             }
-
-            r1 = trimmer1.modify(r1, &mut info1);
-            r2 = trimmer2.modify(r2, &mut info2);
-
-            if let Some(ref mut nt) = n_end_trimmer {
-                r1 = nt.modify(r1, &mut info1);
-                r2 = nt.modify(r2, &mut info2);
-            }
-            if let Some(ref mut sh) = shortener1 {
-                r1 = sh.modify(r1, &mut info1);
-            }
-            if let Some(ref mut sh) = shortener2 {
-                r2 = sh.modify(r2, &mut info2);
-            }
-
-            let filter1 = check_filters(&r1, min_len1, max_len1, cli.max_n);
-            let filter2 = check_filters(&r2, min_len2, max_len2, cli.max_n);
-            let discard = match pair_filter_mode {
-                PairFilterMode::Any => filter1 || filter2,
-                PairFilterMode::Both => filter1 && filter2,
-                PairFilterMode::First => filter1,
-            };
-            if discard {
-                continue;
-            }
-
-            bp_out1 += r1.len() as u64;
-            bp_out2 += r2.len() as u64;
-            n_written += 1;
-            append_record(&mut output_buffer1, &r1, format);
-            append_record(&mut output_buffer2, &r2, format);
-
-            if output_buffer1.len() >= output_buffer_limit {
-                writer1.write_all(&output_buffer1)?;
-                output_buffer1.clear();
-            }
-            if output_buffer2.len() >= output_buffer_limit {
-                writer2.write_all(&output_buffer2)?;
-                output_buffer2.clear();
-            }
         }
-    }
-    if !output_buffer1.is_empty() {
-        writer1.write_all(&output_buffer1)?;
-    }
-    if !output_buffer2.is_empty() {
-        writer2.write_all(&output_buffer2)?;
+
+        for _ in 0..worker_count {
+            let _ = sender.send(None);
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
     }
     writer1.flush()?;
     writer2.flush()?;
 
     Ok((n_reads, n_written, bp_in1, bp_in2, bp_out1, bp_out2,
-        trimmer1.reads_with_adapter, trimmer2.reads_with_adapter))
+        reads_with_adapter1, reads_with_adapter2))
 }
 
 fn check_filters(

@@ -449,7 +449,7 @@ impl ParallelGzipWriter {
         worker_count: usize,
         buffer_size: usize,
     ) -> io::Result<Self> {
-        let chunk_size = buffer_size.max(DEFAULT_BUFFER_SIZE);
+        let chunk_size = buffer_size.max(DEFAULT_BUFFER_SIZE * 8);
         let sink = BufWriter::with_capacity(buffer_size, file);
         let (sender, job_receiver) = mpsc::channel::<Option<GzipJob>>();
         let (result_sender, receiver) = mpsc::channel::<(usize, io::Result<Vec<u8>>)>();
@@ -485,7 +485,7 @@ impl ParallelGzipWriter {
             pending: BTreeMap::new(),
             buffer: Vec::with_capacity(chunk_size),
             chunk_size,
-            max_in_flight: worker_count.saturating_mul(2).max(2),
+            max_in_flight: worker_count.max(1),
             next_sequence: 0,
             next_to_write: 0,
             in_flight: 0,
