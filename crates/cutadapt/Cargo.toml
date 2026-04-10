@@ -1,0 +1,16 @@
+[package]
+name = "cutadapt"
+version = "0.1.0"
+edition = "2021"
+description = "Adapter trimming for sequencing reads — Rust port of cutadapt"
+
+[[bin]]
+name = "cutadapt"
+path = "src/main.rs"
+
+[dependencies]
+cutadapt-core = { path = "../cutadapt-core" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
