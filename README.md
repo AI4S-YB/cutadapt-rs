@@ -97,6 +97,9 @@ The core alignment algorithm is a semi-global dynamic programming approach with:
 ## Benchmark
 
 Tested on 9,880,559 paired-end reads (150 bp, Illumina), standard TruSeq adapter trimming.
+
+### Baseline
+
 Commit: `0ad2e08`
 
 | | Python cutadapt 5.2 | cutadapt-rs |
@@ -107,7 +110,27 @@ Commit: `0ad2e08`
 | R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
 | Total bp written | 2,961,299,044 | 2,961,299,044 |
 
-Results are numerically identical. The current Rust implementation reads all records into memory before processing; streaming + parallel processing is the next optimization target.
+### After streaming + batched output + parallel gzip
+
+Current optimized worktree on branch `perf/speed-opt-20260410`
+
+| | Python cutadapt 5.2 | cutadapt-rs |
+|---|---|---|
+| Time | 1m 07s | 30.59s |
+| Reads processed | 9,880,559 | 9,880,559 |
+| R1 with adapter | 306,997 (3.1%) | 306,997 (3.1%) |
+| R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
+| Total bp written | 2,961,299,044 | 2,961,299,044 |
+| Peak RSS | n/a | ~135 MB |
+
+Additional breakdown for the optimized worktree:
+
+| Mode | Time |
+|---|---|
+| Gzipped FASTQ output | 30.59s |
+| `/dev/null` output | 28.93s |
+
+Results remain numerically identical. The main gains came from replacing `read_all()` with batched streaming, batching output writes, reusing modifiers outside the per-read loop, reducing hot-path cloning, and parallelizing gzip output.
 
 ## Testing
 

@@ -39,4 +39,20 @@ impl ModificationInfo {
             is_rc: None,
         }
     }
+
+    /// Create a lightweight info container for hot paths that do not need the
+    /// original read contents later in the pipeline.
+    pub fn without_original() -> Self {
+        Self {
+            matches: Vec::new(),
+            original_read: SequenceRecord {
+                name: String::new(),
+                sequence: String::new(),
+                qualities: None,
+            },
+            cut_prefix: None,
+            cut_suffix: None,
+            is_rc: None,
+        }
+    }
 }

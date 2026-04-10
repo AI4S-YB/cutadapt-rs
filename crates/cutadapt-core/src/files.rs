@@ -8,6 +8,9 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::collections::BTreeMap;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use bzip2::read::BzDecoder;
 use flate2::read::MultiGzDecoder;
@@ -15,6 +18,8 @@ use flate2::write::GzEncoder;
 use xz2::read::XzDecoder;
 
 use crate::record::SequenceRecord;
+
+const DEFAULT_BUFFER_SIZE: usize = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // FileFormat
@@ -174,7 +179,7 @@ pub fn read_fastq(reader: impl BufRead) -> Result<Vec<SequenceRecord>, io::Error
             })?
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        records.push(SequenceRecord::new(&name, &sequence, Some(&qualities)));
+        records.push(SequenceRecord::from_parts(name, sequence, Some(qualities)));
     }
 
     Ok(records)
@@ -202,8 +207,11 @@ pub fn read_fasta(reader: impl BufRead) -> Result<Vec<SequenceRecord>, io::Error
         if line.starts_with('>') {
             // Flush previous record
             if let Some(name) = current_name.take() {
-                records.push(SequenceRecord::new(&name, &current_seq, None));
-                current_seq.clear();
+                records.push(SequenceRecord::from_parts(
+                    name,
+                    std::mem::take(&mut current_seq),
+                    None,
+                ));
             }
             current_name = Some(line[1..].to_string());
         } else if line.starts_with('#') {
@@ -215,7 +223,147 @@ pub fn read_fasta(reader: impl BufRead) -> Result<Vec<SequenceRecord>, io::Error
     }
     // Flush last record
     if let Some(name) = current_name.take() {
-        records.push(SequenceRecord::new(&name, &current_seq, None));
+        records.push(SequenceRecord::from_parts(name, current_seq, None));
+    }
+
+    Ok(records)
+}
+
+fn trim_line_ending(line: &mut String) {
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+}
+
+/// Parse up to `max_records` FASTQ records from a buffered reader.
+fn read_fastq_batch(
+    reader: &mut dyn BufRead,
+    max_records: usize,
+) -> Result<Vec<SequenceRecord>, io::Error> {
+    let mut records = Vec::with_capacity(max_records);
+    let mut header = String::new();
+    let mut sequence = String::new();
+    let mut separator = String::new();
+    let mut qualities = String::new();
+
+    while records.len() < max_records {
+        header.clear();
+        let n = reader.read_line(&mut header)?;
+        if n == 0 {
+            break;
+        }
+        trim_line_ending(&mut header);
+        if header.is_empty() {
+            continue;
+        }
+        if !header.starts_with('@') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected FASTQ header starting with '@', got: {header}"),
+            ));
+        }
+
+        sequence.clear();
+        if reader.read_line(&mut sequence)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated FASTQ: missing sequence",
+            ));
+        }
+        trim_line_ending(&mut sequence);
+
+        separator.clear();
+        if reader.read_line(&mut separator)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated FASTQ: missing '+' line",
+            ));
+        }
+        trim_line_ending(&mut separator);
+        if !separator.starts_with('+') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected '+' separator in FASTQ, got: {separator}"),
+            ));
+        }
+
+        qualities.clear();
+        if reader.read_line(&mut qualities)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated FASTQ: missing quality line",
+            ));
+        }
+        trim_line_ending(&mut qualities);
+
+        let seq_capacity = sequence.capacity();
+        let qual_capacity = qualities.capacity();
+        let sequence_owned = std::mem::take(&mut sequence);
+        let qualities_owned = std::mem::take(&mut qualities);
+        sequence = String::with_capacity(seq_capacity.max(sequence_owned.len()));
+        qualities = String::with_capacity(qual_capacity.max(qualities_owned.len()));
+
+        records.push(SequenceRecord::from_parts(
+            header[1..].to_string(),
+            sequence_owned,
+            Some(qualities_owned),
+        ));
+    }
+
+    Ok(records)
+}
+
+#[derive(Default)]
+struct FastaReadState {
+    current_name: Option<String>,
+    current_sequence: String,
+    reached_eof: bool,
+}
+
+/// Parse up to `max_records` FASTA records from a buffered reader, preserving
+/// parser state across calls so the caller can stream batches.
+fn read_fasta_batch(
+    reader: &mut dyn BufRead,
+    state: &mut FastaReadState,
+    max_records: usize,
+) -> Result<Vec<SequenceRecord>, io::Error> {
+    let mut records = Vec::with_capacity(max_records);
+    let mut line = String::new();
+
+    while records.len() < max_records {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            state.reached_eof = true;
+            break;
+        }
+        trim_line_ending(&mut line);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('>') {
+            if let Some(name) = state.current_name.replace(rest.to_string()) {
+                let sequence = std::mem::take(&mut state.current_sequence);
+                records.push(SequenceRecord::from_parts(name, sequence, None));
+                if records.len() == max_records {
+                    return Ok(records);
+                }
+            }
+        } else if line.starts_with('#') {
+            continue;
+        } else {
+            state.current_sequence.push_str(&line);
+        }
+    }
+
+    if state.reached_eof && records.len() < max_records {
+        if let Some(name) = state.current_name.take() {
+            let sequence = std::mem::take(&mut state.current_sequence);
+            records.push(SequenceRecord::from_parts(name, sequence, None));
+        }
     }
 
     Ok(records)
@@ -252,6 +400,8 @@ pub struct FileOpener {
     /// Number of threads for external compression.
     /// `None` means use a sensible default.
     pub threads: Option<usize>,
+    /// Buffer size used by buffered readers/writers.
+    pub buffer_size: usize,
 }
 
 impl Default for FileOpener {
@@ -259,6 +409,7 @@ impl Default for FileOpener {
         Self {
             compression_level: 1,
             threads: None,
+            buffer_size: DEFAULT_BUFFER_SIZE,
         }
     }
 }
@@ -272,12 +423,209 @@ pub enum Compression {
     Xz,
 }
 
+struct GzipJob {
+    sequence: usize,
+    data: Vec<u8>,
+}
+
+struct ParallelGzipWriter {
+    sink: BufWriter<File>,
+    sender: Option<mpsc::Sender<Option<GzipJob>>>,
+    receiver: mpsc::Receiver<(usize, io::Result<Vec<u8>>)>,
+    workers: Vec<JoinHandle<()>>,
+    pending: BTreeMap<usize, Vec<u8>>,
+    buffer: Vec<u8>,
+    chunk_size: usize,
+    max_in_flight: usize,
+    next_sequence: usize,
+    next_to_write: usize,
+    in_flight: usize,
+}
+
+impl ParallelGzipWriter {
+    fn new(
+        file: File,
+        compression_level: u32,
+        worker_count: usize,
+        buffer_size: usize,
+    ) -> io::Result<Self> {
+        let chunk_size = buffer_size.max(DEFAULT_BUFFER_SIZE);
+        let sink = BufWriter::with_capacity(buffer_size, file);
+        let (sender, job_receiver) = mpsc::channel::<Option<GzipJob>>();
+        let (result_sender, receiver) = mpsc::channel::<(usize, io::Result<Vec<u8>>)>();
+        let shared_receiver = Arc::new(Mutex::new(job_receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let rx = Arc::clone(&shared_receiver);
+            let tx = result_sender.clone();
+            workers.push(thread::spawn(move || {
+                loop {
+                    let job = match rx.lock().unwrap().recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    };
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let result = compress_gzip_member(job.data, compression_level);
+                    if tx.send((job.sequence, result)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(result_sender);
+
+        Ok(Self {
+            sink,
+            sender: Some(sender),
+            receiver,
+            workers,
+            pending: BTreeMap::new(),
+            buffer: Vec::with_capacity(chunk_size),
+            chunk_size,
+            max_in_flight: worker_count.saturating_mul(2).max(2),
+            next_sequence: 0,
+            next_to_write: 0,
+            in_flight: 0,
+        })
+    }
+
+    fn enqueue_chunk(&mut self, data: Vec<u8>) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "gzip writer has been closed")
+        })?;
+        sender
+            .send(Some(GzipJob {
+                sequence: self.next_sequence,
+                data,
+            }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "gzip worker channel closed"))?;
+        self.next_sequence += 1;
+        self.in_flight += 1;
+
+        if self.in_flight >= self.max_in_flight {
+            self.collect_one_blocking()?;
+        }
+        self.collect_available()?;
+        Ok(())
+    }
+
+    fn flush_pending_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.buffer);
+        self.enqueue_chunk(payload)
+    }
+
+    fn process_result(&mut self, sequence: usize, result: io::Result<Vec<u8>>) -> io::Result<()> {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        let data = result?;
+        self.pending.insert(sequence, data);
+
+        while let Some(chunk) = self.pending.remove(&self.next_to_write) {
+            self.sink.write_all(&chunk)?;
+            self.next_to_write += 1;
+        }
+        Ok(())
+    }
+
+    fn collect_available(&mut self) -> io::Result<()> {
+        while let Ok((sequence, result)) = self.receiver.try_recv() {
+            self.process_result(sequence, result)?;
+        }
+        Ok(())
+    }
+
+    fn collect_one_blocking(&mut self) -> io::Result<()> {
+        let (sequence, result) = self
+            .receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "gzip worker channel closed"))?;
+        self.process_result(sequence, result)
+    }
+
+    fn finish_open_chunks(&mut self) -> io::Result<()> {
+        self.flush_pending_buffer()?;
+        while self.in_flight > 0 {
+            self.collect_one_blocking()?;
+        }
+        self.collect_available()?;
+        self.sink.flush()
+    }
+
+    fn shutdown_workers(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            for _ in 0..self.workers.len() {
+                let _ = sender.send(None);
+            }
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Write for ParallelGzipWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if self.buffer.is_empty() && buf.len() >= self.chunk_size {
+            self.enqueue_chunk(buf.to_vec())?;
+            return Ok(buf.len());
+        }
+
+        self.buffer.extend_from_slice(buf);
+        while self.buffer.len() >= self.chunk_size {
+            let tail = self.buffer.split_off(self.chunk_size);
+            let payload = std::mem::replace(&mut self.buffer, tail);
+            self.enqueue_chunk(payload)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.finish_open_chunks()
+    }
+}
+
+impl Drop for ParallelGzipWriter {
+    fn drop(&mut self) {
+        let _ = self.finish_open_chunks();
+        self.shutdown_workers();
+    }
+}
+
+fn compress_gzip_member(data: Vec<u8>, compression_level: u32) -> io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(compression_level));
+    encoder.write_all(&data)?;
+    encoder.finish()
+}
+
 impl FileOpener {
     pub fn new(compression_level: i32, threads: Option<usize>) -> Self {
         Self {
             compression_level,
             threads,
+            buffer_size: DEFAULT_BUFFER_SIZE,
         }
+    }
+
+    pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
+        self.buffer_size = buffer_size.max(8 * 1024);
+        self
+    }
+
+    fn effective_buffer_size(&self) -> usize {
+        self.buffer_size.max(8 * 1024)
     }
 
     /// Infer compression from the file extension.
@@ -298,15 +646,25 @@ impl FileOpener {
     /// Supports `"-"` for stdin. Compressed formats (.gz, .bz2, .xz) are
     /// auto-detected from the file extension.
     pub fn open_read(&self, path: &str) -> io::Result<Box<dyn BufRead>> {
+        let capacity = self.effective_buffer_size();
         if path == "-" {
-            return Ok(Box::new(BufReader::new(io::stdin())));
+            return Ok(Box::new(BufReader::with_capacity(capacity, io::stdin())));
         }
         let file = File::open(path)?;
         match Self::detect_compression(path) {
-            Compression::None => Ok(Box::new(BufReader::new(file))),
-            Compression::Gzip => Ok(Box::new(BufReader::new(MultiGzDecoder::new(file)))),
-            Compression::Bzip2 => Ok(Box::new(BufReader::new(BzDecoder::new(file)))),
-            Compression::Xz => Ok(Box::new(BufReader::new(XzDecoder::new(file)))),
+            Compression::None => Ok(Box::new(BufReader::with_capacity(capacity, file))),
+            Compression::Gzip => Ok(Box::new(BufReader::with_capacity(
+                capacity,
+                MultiGzDecoder::new(BufReader::with_capacity(capacity, file)),
+            ))),
+            Compression::Bzip2 => Ok(Box::new(BufReader::with_capacity(
+                capacity,
+                BzDecoder::new(BufReader::with_capacity(capacity, file)),
+            ))),
+            Compression::Xz => Ok(Box::new(BufReader::with_capacity(
+                capacity,
+                XzDecoder::new(BufReader::with_capacity(capacity, file)),
+            ))),
         }
     }
 
@@ -314,18 +672,30 @@ impl FileOpener {
     ///
     /// Supports `"-"` for stdout. Gzip compression is applied for `.gz` files.
     pub fn open_write(&self, path: &str) -> io::Result<Box<dyn Write>> {
+        let capacity = self.effective_buffer_size();
         if path == "-" {
-            return Ok(Box::new(BufWriter::new(io::stdout())));
+            return Ok(Box::new(BufWriter::with_capacity(capacity, io::stdout())));
         }
         match Self::detect_compression(path) {
             Compression::None => {
                 let file = File::create(path)?;
-                Ok(Box::new(BufWriter::new(file)))
+                Ok(Box::new(BufWriter::with_capacity(capacity, file)))
             }
             Compression::Gzip => {
-                let file = File::create(path)?;
                 let level = flate2::Compression::new(self.compression_level.max(1) as u32);
-                Ok(Box::new(GzEncoder::new(file, level)))
+                let worker_count = self.threads.unwrap_or(1);
+                if worker_count > 1 {
+                    Ok(Box::new(ParallelGzipWriter::new(
+                        File::create(path)?,
+                        self.compression_level.max(1) as u32,
+                        worker_count,
+                        capacity,
+                    )?))
+                } else {
+                    let file = BufWriter::with_capacity(capacity, File::create(path)?);
+                    let encoder = GzEncoder::new(file, level);
+                    Ok(Box::new(BufWriter::with_capacity(capacity, encoder)))
+                }
             }
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -353,7 +723,10 @@ impl InputPaths {
 
     /// Open all input paths and return an `InputFiles`.
     pub fn open(&self) -> io::Result<InputFiles> {
-        let opener = FileOpener::default();
+        self.open_with_opener(&FileOpener::default())
+    }
+
+    pub fn open_with_opener(&self, opener: &FileOpener) -> io::Result<InputFiles> {
         let mut readers: Vec<Box<dyn BufRead>> = Vec::with_capacity(self.paths.len());
         let mut format: Option<FileFormat> = None;
 
@@ -370,6 +743,9 @@ impl InputPaths {
             readers,
             format: format.unwrap_or(FileFormat::Fastq),
             interleaved: self.interleaved,
+            fasta_states: std::iter::repeat_with(FastaReadState::default)
+                .take(self.paths.len())
+                .collect(),
         })
     }
 }
@@ -379,6 +755,7 @@ pub struct InputFiles {
     pub readers: Vec<Box<dyn BufRead>>,
     pub format: FileFormat,
     pub interleaved: bool,
+    fasta_states: Vec<FastaReadState>,
 }
 
 impl InputFiles {
@@ -394,6 +771,27 @@ impl InputFiles {
         match self.format {
             FileFormat::Fastq => read_fastq(reader),
             FileFormat::Fasta => read_fasta(reader),
+        }
+    }
+
+    pub fn read_batch(
+        &mut self,
+        reader_index: usize,
+        batch_size: usize,
+    ) -> io::Result<Vec<SequenceRecord>> {
+        let reader = self
+            .readers
+            .get_mut(reader_index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Reader index out of range"))?;
+        match self.format {
+            FileFormat::Fastq => read_fastq_batch(reader.as_mut(), batch_size),
+            FileFormat::Fasta => {
+                let state = self
+                    .fasta_states
+                    .get_mut(reader_index)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Reader index out of range"))?;
+                read_fasta_batch(reader.as_mut(), state, batch_size)
+            }
         }
     }
 }
@@ -727,6 +1125,33 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, ">testread\nACGT\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_parallel_gzip_writer_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cutadapt_test_parallel_output.fastq.gz");
+        let path_str = path.to_str().unwrap();
+
+        let opener = FileOpener::new(1, Some(2)).with_buffer_size(1024);
+        {
+            let mut writer = opener.open_write(path_str).unwrap();
+            let rec1 = SequenceRecord::new("test1", "ACGT", Some("IIII"));
+            let rec2 = SequenceRecord::new("test2", "TGCA", Some("HHHH"));
+            write_fastq(&mut writer, &rec1).unwrap();
+            write_fastq(&mut writer, &rec2).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let mut reader = opener.open_read(path_str).unwrap();
+        let parsed = read_fastq(&mut reader).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "test1");
+        assert_eq!(parsed[0].sequence, "ACGT");
+        assert_eq!(parsed[1].name, "test2");
+        assert_eq!(parsed[1].qualities.as_deref(), Some("HHHH"));
 
         let _ = std::fs::remove_file(&path);
     }

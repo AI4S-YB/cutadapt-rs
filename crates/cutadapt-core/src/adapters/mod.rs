@@ -187,6 +187,9 @@ impl MultipleAdapters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ADAPTER_NAME_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_where_values() {
@@ -201,6 +204,7 @@ mod tests {
 
     #[test]
     fn test_generate_adapter_name() {
+        let _guard = ADAPTER_NAME_TEST_LOCK.lock().unwrap();
         reset_adapter_name_counter();
         let name1 = generate_adapter_name();
         let name2 = generate_adapter_name();
@@ -210,6 +214,7 @@ mod tests {
 
     #[test]
     fn test_adapter_enum_single() {
+        let _guard = ADAPTER_NAME_TEST_LOCK.lock().unwrap();
         reset_adapter_name_counter();
         let params = SingleAdapterParams {
             sequence: "AGATCGGAAGAGC".to_string(),
@@ -229,6 +234,7 @@ mod tests {
 
     #[test]
     fn test_multiple_adapters() {
+        let _guard = ADAPTER_NAME_TEST_LOCK.lock().unwrap();
         reset_adapter_name_counter();
         let params1 = SingleAdapterParams {
             sequence: "AAAA".to_string(),
@@ -263,6 +269,7 @@ mod tests {
 
     #[test]
     fn test_multiple_adapters_no_match() {
+        let _guard = ADAPTER_NAME_TEST_LOCK.lock().unwrap();
         reset_adapter_name_counter();
         let params = SingleAdapterParams {
             sequence: "AGATCGGAAGAGC".to_string(),

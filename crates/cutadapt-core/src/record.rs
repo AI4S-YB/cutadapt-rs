@@ -17,6 +17,14 @@ impl SequenceRecord {
         }
     }
 
+    pub fn from_parts(name: String, sequence: String, qualities: Option<String>) -> Self {
+        Self {
+            name,
+            sequence,
+            qualities,
+        }
+    }
+
     /// Return the length of the sequence.
     pub fn len(&self) -> usize {
         self.sequence.len()
