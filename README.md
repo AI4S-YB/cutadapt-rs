@@ -94,6 +94,21 @@ The core alignment algorithm is a semi-global dynamic programming approach with:
 - **K-mer pre-screening** — Shift-and bitmatrix algorithm filters ~99% of reads without running the full aligner
 - **IUPAC wildcard support** — Bitwise AND matching for ambiguity codes
 
+## Benchmark
+
+Tested on 9,880,559 paired-end reads (150 bp, Illumina), standard TruSeq adapter trimming.
+Commit: `0ad2e08`
+
+| | Python cutadapt 5.2 | cutadapt-rs |
+|---|---|---|
+| Time | 1m 07s | 1m 47s |
+| Reads processed | 9,880,559 | 9,880,559 |
+| R1 with adapter | 306,997 (3.1%) | 306,997 (3.1%) |
+| R2 with adapter | 298,514 (3.0%) | 298,514 (3.0%) |
+| Total bp written | 2,961,299,044 | 2,961,299,044 |
+
+Results are numerically identical. The current Rust implementation reads all records into memory before processing; streaming + parallel processing is the next optimization target.
+
 ## Testing
 
 ```bash
