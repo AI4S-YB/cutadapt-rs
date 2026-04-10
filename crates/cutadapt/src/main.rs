@@ -2,6 +2,13 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use std::fmt;
 
+use cutadapt_core::files::{FileFormat, FileOpener, InputPaths};
+use cutadapt_core::modifiers::adapter::AdapterTrimmer;
+use cutadapt_core::modifiers::quality::{QualityTrimmer, NextseqQualityTrimmer};
+use cutadapt_core::modifiers::simple::{UnconditionalCutter, NEndTrimmer, Shortener};
+use cutadapt_core::modifiers::SingleEndModifier;
+use cutadapt_core::parser::{make_adapters_from_specifications, AdapterType, SearchParameters};
+use cutadapt_core::steps::PairFilterMode;
 // ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------
@@ -882,14 +889,442 @@ fn main() -> Result<()> {
     }
 
     // Show what we parsed.
+<<<<<<< HEAD
     print_config(&cli);
 
     println!("NOTE: Actual read processing is not yet implemented.");
     println!("      The pipeline will be wired up in a future step.");
+=======
+    if !cli.quiet {
+        print_config(&cli);
+    }
+
+    run_pipeline(&cli)
+}
+
+fn run_pipeline(cli: &Cli) -> Result<()> {
+    let paired = cli.is_paired();
+
+    // ── Build search parameters ──────────────────────────────────────────
+    let search_params = SearchParameters {
+        max_errors: cli.error_rate,
+        min_overlap: cli.overlap,
+        read_wildcards: cli.match_read_wildcards,
+        adapter_wildcards: !cli.no_match_adapter_wildcards,
+        indels: !cli.no_indels,
+    };
+
+    // ── Build adapters ───────────────────────────────────────────────────
+    let adapter_specs1: Vec<(AdapterType, &str)> = cli
+        .back_adapters.iter().map(|s| (AdapterType::Back, s.as_str()))
+        .chain(cli.front_adapters.iter().map(|s| (AdapterType::Front, s.as_str())))
+        .chain(cli.anywhere_adapters.iter().map(|s| (AdapterType::Anywhere, s.as_str())))
+        .collect();
+
+    let adapter_specs2: Vec<(AdapterType, &str)> = cli
+        .back_adapters2.iter().map(|s| (AdapterType::Back, s.as_str()))
+        .chain(cli.front_adapters2.iter().map(|s| (AdapterType::Front, s.as_str())))
+        .chain(cli.anywhere_adapters2.iter().map(|s| (AdapterType::Anywhere, s.as_str())))
+        .collect();
+
+    let adapters1 = make_adapters_from_specifications(&adapter_specs1, &search_params)
+        .map_err(|e| anyhow::anyhow!("Adapter parse error (R1): {e}"))?;
+    let adapters2 = make_adapters_from_specifications(&adapter_specs2, &search_params)
+        .map_err(|e| anyhow::anyhow!("Adapter parse error (R2): {e}"))?;
+
+    // ── Read input ───────────────────────────────────────────────────────
+    let opener = FileOpener::new(cli.compression_level as i32, None);
+
+    let input_paths = if paired && !cli.interleaved && cli.inputs.len() == 2 {
+        InputPaths::new(cli.inputs.clone(), false)
+    } else {
+        InputPaths::new(cli.inputs.clone(), cli.interleaved)
+    };
+
+    let mut input_files = input_paths.open()?;
+    let format = input_files.format;
+    let has_qualities = format.has_qualities();
+
+    let records1 = input_files.read_all()?;
+    let records2 = if paired && !cli.interleaved && input_files.readers.len() > 1 {
+        let reader = &mut input_files.readers[1];
+        match format {
+            FileFormat::Fastq => cutadapt_core::files::read_fastq(reader)?,
+            FileFormat::Fasta => cutadapt_core::files::read_fasta(reader)?,
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ── Quality cutoffs ──────────────────────────────────────────────────
+    let quality_base = cli.quality_base as i32;
+
+    let qual_cutoff1 = cli.quality_cutoff.as_deref()
+        .map(parse_cutoffs)
+        .transpose()?;
+    let qual_cutoff2 = cli.quality_cutoff2.as_deref()
+        .map(parse_cutoffs)
+        .transpose()?
+        .or(qual_cutoff1);
+
+    // ── Pair filter mode ─────────────────────────────────────────────────
+    let pair_filter_mode = match cli.pair_filter {
+        Some(PairFilter::Both) => PairFilterMode::Both,
+        Some(PairFilter::First) => PairFilterMode::First,
+        _ => PairFilterMode::Any,
+    };
+
+    // ── Min/max lengths ──────────────────────────────────────────────────
+    let (min_len1, min_len2) = parse_paired_length(cli.minimum_length.as_deref())?;
+    let (max_len1, max_len2) = parse_paired_length(cli.maximum_length.as_deref())?;
+
+    // ── Run pipeline ─────────────────────────────────────────────────────
+    let (n_reads, n_written, bp_in1, bp_in2, bp_out1, bp_out2,
+         reads_with_adapter1, reads_with_adapter2) = if paired {
+        run_paired(
+            cli, records1, records2, adapters1, adapters2,
+            &search_params, &opener, format,
+            qual_cutoff1, qual_cutoff2, quality_base,
+            pair_filter_mode, min_len1, min_len2, max_len1, max_len2,
+        )?
+    } else {
+        run_single_direct(
+            cli, &opener, format,
+            qual_cutoff1, quality_base,
+            min_len1, max_len1,
+        )?
+    };
+
+    // ── Print report ─────────────────────────────────────────────────────
+    if !cli.quiet {
+        print_report(
+            paired, n_reads, n_written, bp_in1, bp_in2, bp_out1, bp_out2,
+            reads_with_adapter1, reads_with_adapter2,
+        );
+    }
+>>>>>>> 0ad2e08 (Wire up read processing pipeline in main.rs)
 
     Ok(())
 }
 
+<<<<<<< HEAD
+=======
+#[allow(clippy::too_many_arguments)]
+fn run_single_direct(
+    cli: &Cli,
+    opener: &FileOpener,
+    format: FileFormat,
+    qual_cutoff: Option<(u8, u8)>,
+    quality_base: i32,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+    let input_paths = InputPaths::new(cli.inputs.clone(), cli.interleaved);
+    let mut input_files = input_paths.open()?;
+    let records = input_files.read_all()?;
+    let bp_in1: u64 = records.iter().map(|r| r.len() as u64).sum();
+    let n_reads = records.len() as u64;
+
+    let search_params = SearchParameters {
+        max_errors: cli.error_rate,
+        min_overlap: cli.overlap,
+        read_wildcards: cli.match_read_wildcards,
+        adapter_wildcards: !cli.no_match_adapter_wildcards,
+        indels: !cli.no_indels,
+    };
+    let adapter_specs1: Vec<(AdapterType, &str)> = cli
+        .back_adapters.iter().map(|s| (AdapterType::Back, s.as_str()))
+        .chain(cli.front_adapters.iter().map(|s| (AdapterType::Front, s.as_str())))
+        .chain(cli.anywhere_adapters.iter().map(|s| (AdapterType::Anywhere, s.as_str())))
+        .collect();
+    let adapters1 = make_adapters_from_specifications(&adapter_specs1, &search_params)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut trimmer = AdapterTrimmer::new(adapters1, cli.times);
+
+    let output_path = cli.output.as_deref().unwrap_or("-");
+    let mut writer = opener.open_write(output_path)?;
+
+    let mut n_written: u64 = 0;
+    let mut bp_out1: u64 = 0;
+
+    for record in records {
+        let mut info = cutadapt_core::info::ModificationInfo::new(record.clone());
+        let mut r = record;
+
+        // Pre-adapter cuts
+        for &cut in &cli.cut {
+            let mut cutter = UnconditionalCutter::new(cut);
+            r = cutter.modify(r, &mut info);
+        }
+        // Quality trimming
+        if let Some(cutoff) = cli.nextseq_trim {
+            let mut qt = NextseqQualityTrimmer::new(cutoff as i32, quality_base);
+            r = qt.modify(r, &mut info);
+        } else if let Some((five, three)) = qual_cutoff {
+            if five > 0 || three > 0 {
+                let mut qt = QualityTrimmer::new(five as i32, three as i32, quality_base);
+                r = qt.modify(r, &mut info);
+            }
+        }
+        // Adapter trimming
+        r = trimmer.modify(r, &mut info);
+        // Post-adapter
+        if cli.trim_n {
+            let mut nt = NEndTrimmer::new();
+            r = nt.modify(r, &mut info);
+        }
+        if let Some(len) = cli.length {
+            let mut sh = Shortener::new(len);
+            r = sh.modify(r, &mut info);
+        }
+
+        // Filters
+        if let Some(min) = min_len {
+            if r.len() < min { continue; }
+        }
+        if let Some(max) = max_len {
+            if r.len() > max { continue; }
+        }
+        if let Some(n) = cli.max_n {
+            let n_count = r.sequence.chars().filter(|&c| c == 'N' || c == 'n').count();
+            let threshold = if n < 1.0 { (n * r.len() as f64) as usize } else { n as usize };
+            if n_count > threshold { continue; }
+        }
+
+        // Write
+        bp_out1 += r.len() as u64;
+        n_written += 1;
+        write_record(&mut *writer, &r, format)?;
+    }
+    writer.flush()?;
+
+    Ok((n_reads, n_written, bp_in1, 0, bp_out1, 0,
+        trimmer.reads_with_adapter, 0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paired(
+    cli: &Cli,
+    records1: Vec<cutadapt_core::record::SequenceRecord>,
+    records2: Vec<cutadapt_core::record::SequenceRecord>,
+    adapters1: Vec<cutadapt_core::adapters::Adapter>,
+    adapters2: Vec<cutadapt_core::adapters::Adapter>,
+    _search_params: &SearchParameters,
+    opener: &FileOpener,
+    format: FileFormat,
+    qual_cutoff1: Option<(u8, u8)>,
+    qual_cutoff2: Option<(u8, u8)>,
+    quality_base: i32,
+    pair_filter_mode: PairFilterMode,
+    min_len1: Option<usize>,
+    min_len2: Option<usize>,
+    max_len1: Option<usize>,
+    max_len2: Option<usize>,
+) -> Result<(u64, u64, u64, u64, u64, u64, u64, u64)> {
+    let n_reads = records1.len() as u64;
+    let bp_in1: u64 = records1.iter().map(|r| r.len() as u64).sum();
+    let bp_in2: u64 = records2.iter().map(|r| r.len() as u64).sum();
+
+    let mut trimmer1 = AdapterTrimmer::new(adapters1, cli.times);
+    let mut trimmer2 = AdapterTrimmer::new(adapters2, cli.times);
+
+    let out1_path = cli.output.as_deref().unwrap_or("-");
+    let out2_path = cli.paired_output.as_deref().unwrap_or("-");
+    let mut writer1 = opener.open_write(out1_path)?;
+    let mut writer2 = opener.open_write(out2_path)?;
+
+    let mut n_written: u64 = 0;
+    let mut bp_out1: u64 = 0;
+    let mut bp_out2: u64 = 0;
+
+    for (r1_orig, r2_orig) in records1.into_iter().zip(records2.into_iter()) {
+        let mut info1 = cutadapt_core::info::ModificationInfo::new(r1_orig.clone());
+        let mut info2 = cutadapt_core::info::ModificationInfo::new(r2_orig.clone());
+        let mut r1 = r1_orig;
+        let mut r2 = r2_orig;
+
+        // Pre-adapter cuts R1
+        for &cut in &cli.cut {
+            let mut c = UnconditionalCutter::new(cut);
+            r1 = c.modify(r1, &mut info1);
+        }
+        // Pre-adapter cuts R2
+        for &cut in &cli.cut2 {
+            let mut c = UnconditionalCutter::new(cut);
+            r2 = c.modify(r2, &mut info2);
+        }
+        // Quality trimming R1
+        if let Some(cutoff) = cli.nextseq_trim {
+            let mut qt = NextseqQualityTrimmer::new(cutoff as i32, quality_base);
+            r1 = qt.modify(r1, &mut info1);
+            r2 = qt.modify(r2, &mut info2);
+        } else {
+            if let Some((five, three)) = qual_cutoff1 {
+                if five > 0 || three > 0 {
+                    let mut qt = QualityTrimmer::new(five as i32, three as i32, quality_base);
+                    r1 = qt.modify(r1, &mut info1);
+                }
+            }
+            if let Some((five, three)) = qual_cutoff2 {
+                if five > 0 || three > 0 {
+                    let mut qt = QualityTrimmer::new(five as i32, three as i32, quality_base);
+                    r2 = qt.modify(r2, &mut info2);
+                }
+            }
+        }
+        // Adapter trimming
+        r1 = trimmer1.modify(r1, &mut info1);
+        r2 = trimmer2.modify(r2, &mut info2);
+        // Post-adapter
+        if cli.trim_n {
+            let mut nt = NEndTrimmer::new();
+            r1 = nt.modify(r1, &mut info1);
+            r2 = nt.modify(r2, &mut info2);
+        }
+        if let Some(len) = cli.length {
+            let mut sh = Shortener::new(len);
+            r1 = sh.modify(r1, &mut info1);
+        }
+        if let Some(len) = cli.length2.or(cli.length) {
+            let mut sh = Shortener::new(len);
+            r2 = sh.modify(r2, &mut info2);
+        }
+
+        // Paired filters
+        let filter1 = check_filters(&r1, min_len1, max_len1, cli.max_n);
+        let filter2 = check_filters(&r2, min_len2, max_len2, cli.max_n);
+        let discard = match pair_filter_mode {
+            PairFilterMode::Any => filter1 || filter2,
+            PairFilterMode::Both => filter1 && filter2,
+            PairFilterMode::First => filter1,
+        };
+        if discard { continue; }
+
+        bp_out1 += r1.len() as u64;
+        bp_out2 += r2.len() as u64;
+        n_written += 1;
+        write_record(&mut *writer1, &r1, format)?;
+        write_record(&mut *writer2, &r2, format)?;
+    }
+    writer1.flush()?;
+    writer2.flush()?;
+
+    Ok((n_reads, n_written, bp_in1, bp_in2, bp_out1, bp_out2,
+        trimmer1.reads_with_adapter, trimmer2.reads_with_adapter))
+}
+
+fn check_filters(
+    r: &cutadapt_core::record::SequenceRecord,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+    max_n: Option<f64>,
+) -> bool {
+    if let Some(min) = min_len {
+        if r.len() < min { return true; }
+    }
+    if let Some(max) = max_len {
+        if r.len() > max { return true; }
+    }
+    if let Some(n) = max_n {
+        let n_count = r.sequence.chars().filter(|&c| c == 'N' || c == 'n').count();
+        let threshold = if n < 1.0 { (n * r.len() as f64) as usize } else { n as usize };
+        if n_count > threshold { return true; }
+    }
+    false
+}
+
+fn write_record(
+    writer: &mut dyn std::io::Write,
+    record: &cutadapt_core::record::SequenceRecord,
+    format: FileFormat,
+) -> std::io::Result<()> {
+    match format {
+        FileFormat::Fastq => {
+            let quals = record.qualities.as_deref().unwrap_or("");
+            write!(writer, "@{}\n{}\n+\n{}\n", record.name, record.sequence, quals)
+        }
+        FileFormat::Fasta => {
+            write!(writer, ">{}\n{}\n", record.name, record.sequence)
+        }
+    }
+}
+
+fn parse_paired_length(s: Option<&str>) -> Result<(Option<usize>, Option<usize>)> {
+    match s {
+        None => Ok((None, None)),
+        Some(s) => {
+            let vals = parse_lengths(s)?;
+            let v1 = vals.first().and_then(|v| *v).map(|v| v as usize);
+            let v2 = vals.get(1).and_then(|v| *v).map(|v| v as usize);
+            Ok((v1, v2.or(v1)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_report(
+    paired: bool,
+    n_reads: u64,
+    n_written: u64,
+    bp_in1: u64,
+    bp_in2: u64,
+    bp_out1: u64,
+    bp_out2: u64,
+    reads_with_adapter1: u64,
+    reads_with_adapter2: u64,
+) {
+    println!("=== Summary ===");
+    println!();
+    if paired {
+        println!("Total read pairs processed:    {:>12}", fmt_num(n_reads));
+        println!("  Read 1 with adapter:         {:>12} ({:.1}%)",
+            fmt_num(reads_with_adapter1),
+            pct(reads_with_adapter1, n_reads));
+        println!("  Read 2 with adapter:         {:>12} ({:.1}%)",
+            fmt_num(reads_with_adapter2),
+            pct(reads_with_adapter2, n_reads));
+        println!("Pairs written (passing filters): {:>10} ({:.1}%)",
+            fmt_num(n_written), pct(n_written, n_reads));
+        println!();
+        let bp_in = bp_in1 + bp_in2;
+        let bp_out = bp_out1 + bp_out2;
+        println!("Total basepairs processed: {:>14} bp", fmt_num(bp_in));
+        println!("  Read 1: {:>24} bp", fmt_num(bp_in1));
+        println!("  Read 2: {:>24} bp", fmt_num(bp_in2));
+        println!("Total written (filtered):  {:>14} bp ({:.1}%)",
+            fmt_num(bp_out), pct(bp_out, bp_in));
+        println!("  Read 1: {:>24} bp", fmt_num(bp_out1));
+        println!("  Read 2: {:>24} bp", fmt_num(bp_out2));
+    } else {
+        println!("Total reads processed:         {:>12}", fmt_num(n_reads));
+        println!("Reads with adapters:           {:>12} ({:.1}%)",
+            fmt_num(reads_with_adapter1),
+            pct(reads_with_adapter1, n_reads));
+        println!("Reads written (passing filters): {:>10} ({:.1}%)",
+            fmt_num(n_written), pct(n_written, n_reads));
+        println!();
+        println!("Total basepairs processed: {:>14} bp", fmt_num(bp_in1));
+        println!("Total written (filtered):  {:>14} bp ({:.1}%)",
+            fmt_num(bp_out1), pct(bp_out1, bp_in1));
+    }
+}
+
+fn fmt_num(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 { result.push(','); }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+fn pct(num: u64, den: u64) -> f64 {
+    if den == 0 { 0.0 } else { num as f64 / den as f64 * 100.0 }
+}
+
+>>>>>>> 0ad2e08 (Wire up read processing pipeline in main.rs)
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

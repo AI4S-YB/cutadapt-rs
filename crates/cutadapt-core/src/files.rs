@@ -9,6 +9,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
+use bzip2::read::BzDecoder;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use xz2::read::XzDecoder;
+
 use crate::record::SequenceRecord;
 
 // ---------------------------------------------------------------------------
@@ -62,14 +67,16 @@ pub fn detect_file_format(buf: &[u8]) -> Result<FileFormat, FileFormatError> {
 }
 
 /// Detect format by opening a file, reading a small header, then closing it.
+/// For compressed files (.gz, .bz2, .xz), decompresses the header first.
 pub fn detect_file_format_from_path(path: &str) -> Result<FileFormat, FileFormatError> {
     if path == "-" {
         // Cannot peek at stdin without consuming bytes; default to FASTQ.
         return Ok(FileFormat::Fastq);
     }
-    let mut f = File::open(path).map_err(FileFormatError::Io)?;
+    let opener = FileOpener::default();
+    let mut reader = opener.open_read(path).map_err(FileFormatError::Io)?;
     let mut header = [0u8; 4];
-    let n = f.read(&mut header).map_err(FileFormatError::Io)?;
+    let n = reader.read(&mut header).map_err(FileFormatError::Io)?;
     detect_file_format(&header[..n])
 }
 
@@ -288,39 +295,37 @@ impl FileOpener {
 
     /// Open a file for reading. Returns a boxed `BufRead`.
     ///
-    /// Supports `"-"` for stdin. Compressed formats are detected but
-    /// currently only plain files are handled (compressed support is
-    /// stubbed and will error).
+    /// Supports `"-"` for stdin. Compressed formats (.gz, .bz2, .xz) are
+    /// auto-detected from the file extension.
     pub fn open_read(&self, path: &str) -> io::Result<Box<dyn BufRead>> {
         if path == "-" {
             return Ok(Box::new(BufReader::new(io::stdin())));
         }
-        let compression = Self::detect_compression(path);
-        match compression {
-            Compression::None => {
-                let file = File::open(path)?;
-                Ok(Box::new(BufReader::new(file)))
-            }
-            other => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Compression {:?} not yet implemented for reading", other),
-            )),
+        let file = File::open(path)?;
+        match Self::detect_compression(path) {
+            Compression::None => Ok(Box::new(BufReader::new(file))),
+            Compression::Gzip => Ok(Box::new(BufReader::new(MultiGzDecoder::new(file)))),
+            Compression::Bzip2 => Ok(Box::new(BufReader::new(BzDecoder::new(file)))),
+            Compression::Xz => Ok(Box::new(BufReader::new(XzDecoder::new(file)))),
         }
     }
 
     /// Open a file for writing. Returns a boxed `Write`.
     ///
-    /// Supports `"-"` for stdout. Compressed formats are detected but
-    /// currently only plain files are handled.
+    /// Supports `"-"` for stdout. Gzip compression is applied for `.gz` files.
     pub fn open_write(&self, path: &str) -> io::Result<Box<dyn Write>> {
         if path == "-" {
             return Ok(Box::new(BufWriter::new(io::stdout())));
         }
-        let compression = Self::detect_compression(path);
-        match compression {
+        match Self::detect_compression(path) {
             Compression::None => {
                 let file = File::create(path)?;
                 Ok(Box::new(BufWriter::new(file)))
+            }
+            Compression::Gzip => {
+                let file = File::create(path)?;
+                let level = flate2::Compression::new(self.compression_level.max(1) as u32);
+                Ok(Box::new(GzEncoder::new(file, level)))
             }
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,

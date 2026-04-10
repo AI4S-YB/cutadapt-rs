@@ -5,6 +5,7 @@
 /// Each modifier transforms a [`SequenceRecord`] in place, recording trimming
 /// metadata in [`ModificationInfo`].
 
+pub mod adapter;
 pub mod quality;
 pub mod rename;
 pub mod simple;
